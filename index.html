@@ -39,6 +39,8 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./service-worker.js');
 }
 
+const PENDING_KEY = 'pendingTranscription';
+
 const params = new URLSearchParams(location.search);
 const status = params.get('status');
 const message = params.get('message');
@@ -51,6 +53,28 @@ if (sharePending) {
 } else if (status) {
   history.replaceState({}, '', location.pathname);
   showResult(status, message);
+} else {
+  // Kein frischer Share-Aufruf, aber evtl. laeuft noch eine Transkription von
+  // vorhin - nach einem Reload nicht einfach den leeren Default-Screen
+  // zeigen, sondern das Polling fortsetzen.
+  resumePendingIfAny();
+}
+
+function resumePendingIfAny() {
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    if (!raw) return;
+    const pending = JSON.parse(raw);
+    if (!pending || !pending.fileName || !pending.startedAt) return;
+    if (Date.now() - pending.startedAt > STATUS_POLL_TIMEOUT_MS) {
+      localStorage.removeItem(PENDING_KEY);
+      return;
+    }
+    showLoading('Transkription läuft …');
+    pollStatus(pending.fileName, pending.startedAt);
+  } catch (e) {
+    localStorage.removeItem(PENDING_KEY);
+  }
 }
 
 async function handleSharedFile() {
@@ -100,7 +124,9 @@ async function handleSharedFile() {
     }
 
     showLoading('Hochgeladen. Transkription läuft …');
-    pollStatus(transcription.fileName, Date.now());
+    const startedAt = Date.now();
+    localStorage.setItem(PENDING_KEY, JSON.stringify({ fileName: transcription.fileName, startedAt }));
+    pollStatus(transcription.fileName, startedAt);
 
   } catch (error) {
     showResult('error', error.message);
@@ -111,6 +137,7 @@ async function pollStatus(fileName, startedAt) {
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
 
   if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
+    localStorage.removeItem(PENDING_KEY);
     showLoading('Dauert länger als erwartet. Die E-Mail kommt trotzdem automatisch, sobald fertig.', true);
     return;
   }
@@ -120,10 +147,12 @@ async function pollStatus(fileName, startedAt) {
     const data = await res.json();
 
     if (data.state === 'done') {
+      localStorage.removeItem(PENDING_KEY);
       showResult('ok', '', '✅ Transkription abgeschlossen — E-Mail wurde versendet.');
       return;
     }
     if (data.state === 'error') {
+      localStorage.removeItem(PENDING_KEY);
       showResult('error', '', '❌ Transkription ist fehlgeschlagen.');
       return;
     }
