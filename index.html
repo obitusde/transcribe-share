@@ -43,6 +43,8 @@ if ('serviceWorker' in navigator) {
 }
 
 const PENDING_KEY = 'pendingTranscription';
+const IN_PROGRESS_KEY = 'shareUploadInProgress';
+const IN_PROGRESS_STALE_MS = 3 * 60 * 1000; // 3 Minuten, danach als verloren betrachten
 
 const params = new URLSearchParams(location.search);
 const status = params.get('status');
@@ -59,24 +61,42 @@ if (sharePending) {
 } else {
   // Kein frischer Share-Aufruf, aber evtl. laeuft noch eine Transkription von
   // vorhin - nach einem Reload nicht einfach den leeren Default-Screen
-  // zeigen, sondern das Polling fortsetzen.
+  // zeigen, sondern das Polling fortsetzen (oder zumindest einen Hinweis
+  // zeigen, falls der Upload selbst noch lief).
   resumePendingIfAny();
 }
 
 function resumePendingIfAny() {
   try {
     const raw = localStorage.getItem(PENDING_KEY);
-    if (!raw) return;
-    const pending = JSON.parse(raw);
-    if (!pending || !pending.fileName || !pending.startedAt) return;
-    if (Date.now() - pending.startedAt > STATUS_POLL_TIMEOUT_MS) {
+    if (raw) {
+      const pending = JSON.parse(raw);
+      if (pending && pending.fileName && pending.startedAt && Date.now() - pending.startedAt <= STATUS_POLL_TIMEOUT_MS) {
+        showLoading('Transkription läuft …');
+        pollStatus(pending.fileName, pending.startedAt);
+        return;
+      }
       localStorage.removeItem(PENDING_KEY);
-      return;
     }
-    showLoading('Transkription läuft …');
-    pollStatus(pending.fileName, pending.startedAt);
   } catch (e) {
     localStorage.removeItem(PENDING_KEY);
+  }
+
+  // Kein bekannter Polling-Status, aber evtl. war ein Upload unterwegs, als
+  // die Seite neu geladen wurde (die Original-Datei ist dann weg, ein echtes
+  // Fortsetzen ist nicht moeglich - aber wenigstens ein hilfreicher Hinweis
+  // statt der leeren Default-Seite).
+  try {
+    const rawInProgress = localStorage.getItem(IN_PROGRESS_KEY);
+    if (rawInProgress) {
+      const inProgress = JSON.parse(rawInProgress);
+      localStorage.removeItem(IN_PROGRESS_KEY);
+      if (inProgress && inProgress.startedAt && Date.now() - inProgress.startedAt <= IN_PROGRESS_STALE_MS) {
+        showResult('error', '', '⚠️ Die Seite wurde während eines laufenden Uploads neu geladen. Bitte prüfe kurz dein E-Mail-Postfach oder teile die Datei erneut.');
+      }
+    }
+  } catch (e) {
+    localStorage.removeItem(IN_PROGRESS_KEY);
   }
 }
 
@@ -94,6 +114,8 @@ async function handleSharedFile() {
     const mimeType = cached.headers.get('Content-Type') || 'audio/mp4';
     const blob = await cached.blob();
     await cache.delete(SHARE_CACHE_KEY);
+
+    localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify({ startedAt: Date.now() }));
 
     const sizeMb = Math.round(blob.size / 1024 / 1024 * 10) / 10;
     showLoading(`Wird hochgeladen … (${filename}, ${sizeMb} MB)`);
@@ -120,6 +142,7 @@ async function handleSharedFile() {
     } catch (fetchError) {
       clearInterval(tickInterval);
       clearTimeout(timeoutId);
+      localStorage.removeItem(IN_PROGRESS_KEY);
       if (fetchError.name === 'AbortError') {
         showResult('error', '', `❌ Upload dauerte länger als ${UPLOAD_TIMEOUT_MS / 1000}s und wurde abgebrochen. Bitte erneut versuchen (evtl. mit besserem Netz).`);
       } else {
@@ -139,23 +162,27 @@ async function handleSharedFile() {
     }
 
     if (!parsed || parsed.status !== 'ok') {
+      localStorage.removeItem(IN_PROGRESS_KEY);
       showResult('error', text);
       return;
     }
 
     const transcription = parsed.transcription;
     if (!transcription || transcription.status !== 'processing' || !transcription.fileName) {
+      localStorage.removeItem(IN_PROGRESS_KEY);
       const detail = transcription ? transcription.message : 'Transkription wurde nicht gestartet.';
       showResult('error', `Hochgeladen, aber Transkription nicht gestartet: ${detail}`);
       return;
     }
 
+    localStorage.removeItem(IN_PROGRESS_KEY);
     showLoading('Hochgeladen. Transkription läuft …');
     const startedAt = Date.now();
     localStorage.setItem(PENDING_KEY, JSON.stringify({ fileName: transcription.fileName, startedAt }));
     pollStatus(transcription.fileName, startedAt);
 
   } catch (error) {
+    localStorage.removeItem(IN_PROGRESS_KEY);
     showResult('error', error.message);
   }
 }
@@ -208,14 +235,18 @@ function showResult(status, message, title) {
 }
 
 function blobToBase64(blob) {
-  return blob.arrayBuffer().then((buffer) => {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
+  // FileReader.readAsDataURL nutzt die native Browser-Implementierung statt
+  // einer manuellen JS-Schleife + btoa() - bei groesseren Dateien auf
+  // schwaecheren Mobilgeraeten spuerbar schneller (die alte Variante konnte
+  // den Haupt-Thread laenger blockieren, bevor der Upload ueberhaupt startete).
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      resolve(result.substring(result.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(reader.error || new Error('Datei konnte nicht gelesen werden.'));
+    reader.readAsDataURL(blob);
   });
 }
 </script>
