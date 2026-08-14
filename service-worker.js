@@ -1,13 +1,18 @@
 // service-worker.js
-// Version: 2 (2026-08-14)
+// Version: 3 (2026-08-14)
 // Faengt den Web-Share-Target-POST ab, legt die geteilte Datei kurz im Cache
 // ab und leitet SOFORT zur Seite weiter (statt den kompletten Upload
 // abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
 // eingefrorenen weissen Bildschirm waehrend des Uploads). Die eigentliche
 // Base64-Kodierung + der Upload passieren danach in index.html, wo eine
 // sichtbare Ladeanzeige moeglich ist.
+//
+// v3: Navigation nutzt jetzt cache:'no-store', damit Aenderungen an
+// index.html IMMER sofort ankommen, ohne dass der Nutzer manuell den
+// Browser-Cache leeren muss (network-first allein reichte nicht, weil
+// fetch() sonst still aus dem normalen HTTP-Cache bedient werden kann).
 
-const CACHE_VERSION = 'transcribe-share-v2';
+const CACHE_VERSION = 'transcribe-share-v3';
 const SHARE_CACHE_KEY = './__shared-file__';
 
 const PRECACHE = [
@@ -39,11 +44,12 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Navigation: network-first, damit Aenderungen an index.html nicht ewig im
-  // Cache haengen bleiben (bekannter Fallstrick aus einem frueheren Projekt).
+  // Navigation: IMMER frisch vom Netz (no-store), damit Aenderungen an
+  // index.html sofort ankommen. Reines "network-first" reicht nicht, weil
+  // fetch() sonst still aus dem normalen HTTP-Cache bedient werden kann.
   if (event.request.mode === 'navigate') {
     event.respondWith(
-      fetch(event.request).catch(() => caches.match('./index.html'))
+      fetch(event.request.url, { cache: 'no-store' }).catch(() => caches.match('./index.html'))
     );
     return;
   }
