@@ -8,10 +8,17 @@
 <meta name="theme-color" content="#2c3e50">
 <style>
   body { font-family: sans-serif; max-width: 480px; margin: 3rem auto; padding: 0 1rem; text-align: center; color: #2c3e50; }
-  .status { padding: 1.25rem; border-radius: 8px; margin-top: 1.5rem; }
+  .status { padding: 1.25rem; border-radius: 8px; margin-top: 1.5rem; display: flex; flex-direction: column; align-items: center; gap: 0.6rem; }
   .status.ok { background: #e6f4ea; color: #1e7e34; }
   .status.error { background: #fdecea; color: #b71c1c; }
-  .status .detail { font-size: 0.8rem; margin-top: 0.5rem; word-break: break-all; opacity: 0.85; }
+  .status.loading { background: #eef1f4; color: #2c3e50; }
+  .status .detail { font-size: 0.8rem; margin-top: 0.25rem; word-break: break-all; opacity: 0.85; }
+  .spinner {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 3px solid rgba(44,62,80,0.2); border-top-color: #2c3e50;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .hint { color: #777; font-size: 0.9rem; margin-top: 2.5rem; }
 </style>
 </head>
@@ -22,6 +29,10 @@
   <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü.</p>
 
 <script>
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
+const CACHE_VERSION = 'transcribe-share-v2';
+const SHARE_CACHE_KEY = './__shared-file__';
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./service-worker.js');
 }
@@ -29,14 +40,80 @@ if ('serviceWorker' in navigator) {
 const params = new URLSearchParams(location.search);
 const status = params.get('status');
 const message = params.get('message');
-if (status) {
-  const el = document.getElementById('result');
+const sharePending = params.get('share') === 'pending';
+
+if (sharePending) {
+  history.replaceState({}, '', location.pathname);
+  showLoading('Geteilte Datei wird verarbeitet …');
+  handleSharedFile();
+} else if (status) {
+  history.replaceState({}, '', location.pathname);
+  showResult(status, message);
+}
+
+async function handleSharedFile() {
+  try {
+    const cache = await caches.open(CACHE_VERSION);
+    const cached = await cache.match(SHARE_CACHE_KEY);
+
+    if (!cached) {
+      showResult('error', 'Keine geteilte Datei im Zwischenspeicher gefunden.');
+      return;
+    }
+
+    const filename = decodeURIComponent(cached.headers.get('X-Shared-Filename') || 'share-upload.m4a');
+    const mimeType = cached.headers.get('Content-Type') || 'audio/mp4';
+    const blob = await cached.blob();
+    await cache.delete(SHARE_CACHE_KEY);
+
+    const sizeMb = Math.round(blob.size / 1024 / 1024 * 10) / 10;
+    showLoading(`Wird hochgeladen … (${filename}, ${sizeMb} MB)`);
+
+    const base64 = await blobToBase64(blob);
+
+    const res = await fetch(SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ filename, mimeType, data: base64 })
+    });
+
+    const text = await res.text();
+    let ok = false;
+    try {
+      ok = JSON.parse(text).status === 'ok';
+    } catch (e) {
+      // Antwort war kein JSON - als Fehler behandeln, Rohtext zeigen.
+    }
+    showResult(ok ? 'ok' : 'error', text);
+
+  } catch (error) {
+    showResult('error', error.message);
+  }
+}
+
+function showLoading(text) {
+  document.getElementById('result').innerHTML =
+    `<div class="status loading"><div class="spinner"></div><div>${text}</div></div>`;
+}
+
+function showResult(status, message) {
   const escaped = (message || '').replace(/</g, '&lt;');
-  el.innerHTML = `<div class="status ${status === 'ok' ? 'ok' : 'error'}">
-    ${status === 'ok' ? '✅ Erfolgreich hochgeladen.' : '❌ Fehler beim Hochladen.'}
+  document.getElementById('result').innerHTML = `<div class="status ${status === 'ok' ? 'ok' : 'error'}">
+    <div>${status === 'ok' ? '✅ Erfolgreich hochgeladen.' : '❌ Fehler beim Hochladen.'}</div>
     <div class="detail">${escaped}</div>
   </div>`;
-  history.replaceState({}, '', location.pathname);
+}
+
+function blobToBase64(blob) {
+  return blob.arrayBuffer().then((buffer) => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  });
 }
 </script>
 </body>

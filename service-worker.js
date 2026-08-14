@@ -1,11 +1,14 @@
 // service-worker.js
-// Version: 1 (2026-08-14)
-// Faengt den Web-Share-Target-POST ab, liest die geteilte Audiodatei, kodiert
-// sie als Base64 und schickt sie im selben Muster wie diagnose-upload-test.html
-// an die Apps-Script-doPost-URL weiter.
+// Version: 2 (2026-08-14)
+// Faengt den Web-Share-Target-POST ab, legt die geteilte Datei kurz im Cache
+// ab und leitet SOFORT zur Seite weiter (statt den kompletten Upload
+// abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
+// eingefrorenen weissen Bildschirm waehrend des Uploads). Die eigentliche
+// Base64-Kodierung + der Upload passieren danach in index.html, wo eine
+// sichtbare Ladeanzeige moeglich ist.
 
-const CACHE_VERSION = 'transcribe-share-v1';
-const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
+const CACHE_VERSION = 'transcribe-share-v2';
+const SHARE_CACHE_KEY = './__shared-file__';
 
 const PRECACHE = [
   './',
@@ -56,50 +59,22 @@ async function handleShareTarget(request) {
     const file = formData.get('audio');
 
     if (!file) {
-      return redirectWithStatus('error', 'Keine Datei empfangen.');
+      return Response.redirect('./?status=error&message=' + encodeURIComponent('Keine Datei empfangen.'), 303);
     }
 
-    const base64 = await blobToBase64(file);
+    const cache = await caches.open(CACHE_VERSION);
+    await cache.put(SHARE_CACHE_KEY, new Response(file, {
+      headers: {
+        'Content-Type': file.type || 'application/octet-stream',
+        'X-Shared-Filename': encodeURIComponent(file.name || 'share-upload.m4a')
+      }
+    }));
 
-    const response = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        filename: file.name || 'share-upload.m4a',
-        mimeType: file.type || 'audio/mp4',
-        data: base64
-      })
-    });
-
-    const text = await response.text();
-    let ok = false;
-    try {
-      ok = JSON.parse(text).status === 'ok';
-    } catch (e) {
-      // Antwort war kein JSON - als Fehler behandeln, Rohtext zeigen.
-    }
-
-    return redirectWithStatus(ok ? 'ok' : 'error', text);
+    // Schneller Redirect, BEVOR hochgeladen wird - die Seite laedt jetzt
+    // sofort und zeigt selbst eine Ladeanzeige waehrend des eigentlichen Uploads.
+    return Response.redirect('./?share=pending', 303);
 
   } catch (error) {
-    return redirectWithStatus('error', error.message);
+    return Response.redirect('./?status=error&message=' + encodeURIComponent(error.message), 303);
   }
-}
-
-function redirectWithStatus(status, message) {
-  const safeMessage = (message || '').slice(0, 400);
-  const target = `./?status=${encodeURIComponent(status)}&message=${encodeURIComponent(safeMessage)}`;
-  return Response.redirect(target, 303);
-}
-
-function blobToBase64(blob) {
-  return blob.arrayBuffer().then((buffer) => {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
-  });
 }
