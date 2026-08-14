@@ -34,9 +34,12 @@ const CACHE_VERSION = 'transcribe-share-v3';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
+const UPLOAD_TIMEOUT_MS = 90 * 1000; // 90 Sekunden fuer den eigentlichen Upload-Request
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./service-worker.js');
+  // .update() erzwingt eine sofortige Pruefung auf eine neue Service-Worker-
+  // Version, statt auf Chromes eigenen (bis zu 24h) Update-Timer zu warten.
+  navigator.serviceWorker.register('./service-worker.js').then((reg) => reg.update());
 }
 
 const PENDING_KEY = 'pendingTranscription';
@@ -97,11 +100,35 @@ async function handleSharedFile() {
 
     const base64 = await blobToBase64(blob);
 
-    const res = await fetch(SCRIPT_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ filename, mimeType, data: base64 })
-    });
+    const uploadStartedAt = Date.now();
+    const tickInterval = setInterval(() => {
+      const s = Math.round((Date.now() - uploadStartedAt) / 1000);
+      showLoading(`Wird hochgeladen … (${filename}, ${sizeMb} MB, ${s}s)`);
+    }, 1000);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
+
+    let res;
+    try {
+      res = await fetch(SCRIPT_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ filename, mimeType, data: base64 }),
+        signal: controller.signal
+      });
+    } catch (fetchError) {
+      clearInterval(tickInterval);
+      clearTimeout(timeoutId);
+      if (fetchError.name === 'AbortError') {
+        showResult('error', '', `❌ Upload dauerte länger als ${UPLOAD_TIMEOUT_MS / 1000}s und wurde abgebrochen. Bitte erneut versuchen (evtl. mit besserem Netz).`);
+      } else {
+        showResult('error', fetchError.message);
+      }
+      return;
+    }
+    clearInterval(tickInterval);
+    clearTimeout(timeoutId);
 
     const text = await res.text();
     let parsed = null;
