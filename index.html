@@ -108,6 +108,8 @@ async function handleSharedFile() {
 }
 
 async function pollStatus(fileName, startedAt) {
+  const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+
   if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
     showLoading('Dauert länger als erwartet. Die E-Mail kommt trotzdem automatisch, sobald fertig.', true);
     return;
@@ -126,9 +128,10 @@ async function pollStatus(fileName, startedAt) {
       return;
     }
     // 'transcribing' oder 'unknown' (kurze Uebergangsphase direkt nach dem Upload) -> weiter warten.
-    showLoading('Transkription läuft …');
+    // Laufende Sekundenanzeige, damit klar ist: der Prozess haengt nicht, er arbeitet noch.
+    showLoading(`Transkription läuft … (${elapsedSec}s)`);
   } catch (error) {
-    // Netzwerkfehler beim Poll selbst - stillschweigend erneut versuchen.
+    showLoading(`Transkription läuft … (${elapsedSec}s, kurzer Verbindungsfehler, versuche weiter)`);
   }
 
   setTimeout(() => pollStatus(fileName, startedAt), STATUS_POLL_INTERVAL_MS);
