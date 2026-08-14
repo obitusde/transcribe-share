@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transkription Upload</title>
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#2c3e50">
+<style>
+  body { font-family: sans-serif; max-width: 480px; margin: 3rem auto; padding: 0 1rem; text-align: center; color: #2c3e50; }
+  .status { padding: 1.25rem; border-radius: 8px; margin-top: 1.5rem; }
+  .status.ok { background: #e6f4ea; color: #1e7e34; }
+  .status.error { background: #fdecea; color: #b71c1c; }
+  .status .detail { font-size: 0.8rem; margin-top: 0.5rem; word-break: break-all; opacity: 0.85; }
+  .hint { color: #777; font-size: 0.9rem; margin-top: 2.5rem; }
+</style>
+</head>
+<body>
+  <h1>🎙️ Transkription Upload</h1>
+  <p>Diese Seite empfängt geteilte Sprachmemos aus dem Google Recorder und schickt sie automatisch zur Transkription.</p>
+  <div id="result"></div>
+  <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü.</p>
+
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./service-worker.js');
+}
+
+const params = new URLSearchParams(location.search);
+const status = params.get('status');
+const message = params.get('message');
+if (status) {
+  const el = document.getElementById('result');
+  const escaped = (message || '').replace(/</g, '&lt;');
+  el.innerHTML = `<div class="status ${status === 'ok' ? 'ok' : 'error'}">
+    ${status === 'ok' ? '✅ Erfolgreich hochgeladen.' : '❌ Fehler beim Hochladen.'}
+    <div class="detail">${escaped}</div>
+  </div>`;
+  history.replaceState({}, '', location.pathname);
+}
+</script>
+</body>
+</html>
