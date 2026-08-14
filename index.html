@@ -32,6 +32,8 @@
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
 const CACHE_VERSION = 'transcribe-share-v2';
 const SHARE_CACHE_KEY = './__shared-file__';
+const STATUS_POLL_INTERVAL_MS = 4000;
+const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./service-worker.js');
@@ -78,29 +80,71 @@ async function handleSharedFile() {
     });
 
     const text = await res.text();
-    let ok = false;
+    let parsed = null;
     try {
-      ok = JSON.parse(text).status === 'ok';
+      parsed = JSON.parse(text);
     } catch (e) {
-      // Antwort war kein JSON - als Fehler behandeln, Rohtext zeigen.
+      // Antwort war kein JSON.
     }
-    showResult(ok ? 'ok' : 'error', text);
+
+    if (!parsed || parsed.status !== 'ok') {
+      showResult('error', text);
+      return;
+    }
+
+    const transcription = parsed.transcription;
+    if (!transcription || transcription.status !== 'processing' || !transcription.fileName) {
+      const detail = transcription ? transcription.message : 'Transkription wurde nicht gestartet.';
+      showResult('error', `Hochgeladen, aber Transkription nicht gestartet: ${detail}`);
+      return;
+    }
+
+    showLoading('Hochgeladen. Transkription läuft …');
+    pollStatus(transcription.fileName, Date.now());
 
   } catch (error) {
     showResult('error', error.message);
   }
 }
 
-function showLoading(text) {
-  document.getElementById('result').innerHTML =
-    `<div class="status loading"><div class="spinner"></div><div>${text}</div></div>`;
+async function pollStatus(fileName, startedAt) {
+  if (Date.now() - startedAt > STATUS_POLL_TIMEOUT_MS) {
+    showLoading('Dauert länger als erwartet. Die E-Mail kommt trotzdem automatisch, sobald fertig.', true);
+    return;
+  }
+
+  try {
+    const res = await fetch(`${SCRIPT_URL}?action=status&file=${encodeURIComponent(fileName)}`);
+    const data = await res.json();
+
+    if (data.state === 'done') {
+      showResult('ok', '', '✅ Transkription abgeschlossen — E-Mail wurde versendet.');
+      return;
+    }
+    if (data.state === 'error') {
+      showResult('error', '', '❌ Transkription ist fehlgeschlagen.');
+      return;
+    }
+    // 'transcribing' oder 'unknown' (kurze Uebergangsphase direkt nach dem Upload) -> weiter warten.
+    showLoading('Transkription läuft …');
+  } catch (error) {
+    // Netzwerkfehler beim Poll selbst - stillschweigend erneut versuchen.
+  }
+
+  setTimeout(() => pollStatus(fileName, startedAt), STATUS_POLL_INTERVAL_MS);
 }
 
-function showResult(status, message) {
+function showLoading(text, final) {
+  document.getElementById('result').innerHTML =
+    `<div class="status loading">${final ? '' : '<div class="spinner"></div>'}<div>${text}</div></div>`;
+}
+
+function showResult(status, message, title) {
   const escaped = (message || '').replace(/</g, '&lt;');
+  const heading = title || (status === 'ok' ? '✅ Erfolgreich hochgeladen.' : '❌ Fehler beim Hochladen.');
   document.getElementById('result').innerHTML = `<div class="status ${status === 'ok' ? 'ok' : 'error'}">
-    <div>${status === 'ok' ? '✅ Erfolgreich hochgeladen.' : '❌ Fehler beim Hochladen.'}</div>
-    <div class="detail">${escaped}</div>
+    <div>${heading}</div>
+    ${escaped ? `<div class="detail">${escaped}</div>` : ''}
   </div>`;
 }
 
