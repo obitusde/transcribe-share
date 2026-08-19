@@ -1,5 +1,5 @@
 // service-worker.js
-// Version: 4 (2026-08-19)
+// Version: 5 (2026-08-19)
 // Faengt den Web-Share-Target-POST ab, legt die geteilte Datei kurz im Cache
 // ab und leitet SOFORT zur Seite weiter (statt den kompletten Upload
 // abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
@@ -12,7 +12,7 @@
 // Browser-Cache leeren muss (network-first allein reichte nicht, weil
 // fetch() sonst still aus dem normalen HTTP-Cache bedient werden kann).
 
-const CACHE_VERSION = 'transcribe-share-v4';
+const CACHE_VERSION = 'transcribe-share-v5';
 const SHARE_CACHE_KEY = './__shared-file__';
 
 const PRECACHE = [

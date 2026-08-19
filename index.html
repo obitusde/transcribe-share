@@ -30,7 +30,7 @@
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v4';
+const CACHE_VERSION = 'transcribe-share-v5';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -160,7 +160,9 @@ async function uploadDirectToDrive(blob, filename, mimeType, sizeMb) {
   showLoading(`Upload wird vorbereitet … (${filename}, ${sizeMb} MB)`);
 
   const init = await postJsonToScript(
-    { action: 'initUpload', filename, mimeType, size: blob.size },
+    // origin: der Upload-Server schickt nur dann CORS-Header auf die
+    // Antwort des PUT, wenn schon die Session mit diesem Origin eroeffnet wurde.
+    { action: 'initUpload', filename, mimeType, size: blob.size, origin: location.origin },
     HANDSHAKE_TIMEOUT_MS
   );
 
