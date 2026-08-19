@@ -30,11 +30,13 @@
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v3';
+const CACHE_VERSION = 'transcribe-share-v4';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
-const UPLOAD_TIMEOUT_MS = 90 * 1000; // 90 Sekunden fuer den eigentlichen Upload-Request
+const UPLOAD_TIMEOUT_MS = 90 * 1000; // nur noch fuer den Base64-Ersatzweg
+const HANDSHAKE_TIMEOUT_MS = 30 * 1000; // die winzigen init/complete-Requests
+const DIRECT_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000; // Direkt-Upload, grosszuegig fuer schwaches Netz
 
 if ('serviceWorker' in navigator) {
   // .update() erzwingt eine sofortige Pruefung auf eine neue Service-Worker-
@@ -118,61 +120,17 @@ async function handleSharedFile() {
     localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify({ startedAt: Date.now() }));
 
     const sizeMb = Math.round(blob.size / 1024 / 1024 * 10) / 10;
-    showLoading(`Wird hochgeladen … (${filename}, ${sizeMb} MB)`);
 
-    const base64 = await blobToBase64(blob);
-
-    const uploadStartedAt = Date.now();
-    const tickInterval = setInterval(() => {
-      const s = Math.round((Date.now() - uploadStartedAt) / 1000);
-      showLoading(`Wird hochgeladen … (${filename}, ${sizeMb} MB, ${s}s)`);
-    }, 1000);
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
-
-    let res;
+    // Bevorzugt: Bytes direkt zu Drive, ohne Umweg ueber Apps Script.
+    // Faellt das aus (alte Server-Version, CORS-Problem, o.ae.), greift
+    // automatisch der alte Base64-Weg - langsam, aber funktionierend.
+    let transcription;
     try {
-      res = await fetch(SCRIPT_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ filename, mimeType, data: base64 }),
-        signal: controller.signal
-      });
-    } catch (fetchError) {
-      clearInterval(tickInterval);
-      clearTimeout(timeoutId);
-      localStorage.removeItem(IN_PROGRESS_KEY);
-      if (fetchError.name === 'AbortError') {
-        showResult('error', '', `❌ Upload dauerte länger als ${UPLOAD_TIMEOUT_MS / 1000}s und wurde abgebrochen. Bitte erneut versuchen (evtl. mit besserem Netz).`);
-      } else {
-        showResult('error', fetchError.message);
-      }
-      return;
-    }
-    clearInterval(tickInterval);
-    clearTimeout(timeoutId);
-
-    const text = await res.text();
-    let parsed = null;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      // Antwort war kein JSON.
-    }
-
-    if (!parsed || parsed.status !== 'ok') {
-      localStorage.removeItem(IN_PROGRESS_KEY);
-      showResult('error', text);
-      return;
-    }
-
-    const transcription = parsed.transcription;
-    if (!transcription || transcription.status !== 'processing' || !transcription.fileName) {
-      localStorage.removeItem(IN_PROGRESS_KEY);
-      const detail = transcription ? transcription.message : 'Transkription wurde nicht gestartet.';
-      showResult('error', `Hochgeladen, aber Transkription nicht gestartet: ${detail}`);
-      return;
+      transcription = await uploadDirectToDrive(blob, filename, mimeType, sizeMb);
+    } catch (directError) {
+      if (directError.noFallback) throw directError;
+      showLoading(`Direkter Upload nicht verfügbar (${directError.message}) — nutze Ersatzweg …`);
+      transcription = await uploadViaAppsScript(blob, filename, mimeType, sizeMb);
     }
 
     localStorage.removeItem(IN_PROGRESS_KEY);
@@ -184,6 +142,164 @@ async function handleSharedFile() {
   } catch (error) {
     localStorage.removeItem(IN_PROGRESS_KEY);
     showResult('error', error.message);
+  }
+}
+
+/**
+ * Schneller Weg: Apps Script eroeffnet nur eine Drive-Upload-Session, die
+ * eigentlichen Bytes gehen als rohes Binary direkt an Google.
+ *
+ * Spart gegenueber dem alten Weg zweierlei: die ~33% Base64-Aufblaehung und
+ * - viel wichtiger - die komplette synchrone Verarbeitung des Megabyte-
+ * Payloads in der Apps-Script-Sandbox.
+ */
+async function uploadDirectToDrive(blob, filename, mimeType, sizeMb) {
+  showLoading(`Upload wird vorbereitet … (${filename}, ${sizeMb} MB)`);
+
+  const init = await postJsonToScript(
+    { action: 'initUpload', filename, mimeType, size: blob.size },
+    HANDSHAKE_TIMEOUT_MS
+  );
+
+  if (!init || init.status !== 'ok' || !init.uploadUrl || !init.fileName) {
+    throw new Error((init && init.message) || 'Server lieferte keine Upload-Session');
+  }
+
+  const driveFile = await putBlobWithProgress(init.uploadUrl, blob, mimeType, sizeMb);
+
+  if (!driveFile || !driveFile.id) {
+    const err = new Error('Drive bestätigte den Upload nicht.');
+    err.noFallback = true; // Bytes sind evtl. schon oben - nicht nochmal senden.
+    throw err;
+  }
+
+  showLoading('Upload fertig. Transkription wird gestartet …');
+
+  let done;
+  try {
+    done = await postJsonToScript(
+      { action: 'completeUpload', fileId: driveFile.id, fileName: init.fileName },
+      HANDSHAKE_TIMEOUT_MS
+    );
+  } catch (e) {
+    e.noFallback = true;
+    throw e;
+  }
+
+  const transcription = done && done.transcription;
+  if (!done || done.status !== 'ok' || !transcription || transcription.status !== 'processing' || !transcription.fileName) {
+    const err = new Error(
+      'Hochgeladen, aber Transkription nicht gestartet: ' +
+      ((done && done.message) || (transcription && transcription.message) || 'unbekannter Fehler')
+    );
+    err.noFallback = true;
+    throw err;
+  }
+
+  return transcription;
+}
+
+/** PUT der Rohdaten an die Drive-Session-URL, mit echter Fortschrittsanzeige. */
+function putBlobWithProgress(uploadUrl, blob, mimeType, sizeMb) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', uploadUrl, true);
+    xhr.setRequestHeader('Content-Type', mimeType);
+    xhr.timeout = DIRECT_UPLOAD_TIMEOUT_MS;
+
+    const startedAt = Date.now();
+
+    // fetch() kennt keinen Upload-Fortschritt - daher hier bewusst XHR:
+    // bei 17 MB ist der Unterschied zwischen "haengt" und "laeuft" sichtbar.
+    xhr.upload.onprogress = (ev) => {
+      if (!ev.lengthComputable) return;
+      const pct = Math.round(ev.loaded / ev.total * 100);
+      const secs = Math.max(0.1, (Date.now() - startedAt) / 1000);
+      const mbps = (ev.loaded / 1024 / 1024) / secs;
+      showLoading(`Wird hochgeladen … ${pct}% (${sizeMb} MB, ${mbps.toFixed(1)} MB/s)`);
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (e) {
+          reject(new Error('Drive-Antwort war unlesbar'));
+        }
+        return;
+      }
+      reject(new Error(`Drive antwortete HTTP ${xhr.status}`));
+    };
+
+    xhr.onerror = () => reject(new Error('Netzwerk- oder CORS-Fehler'));
+    xhr.ontimeout = () => reject(new Error(`Timeout nach ${DIRECT_UPLOAD_TIMEOUT_MS / 1000}s`));
+
+    xhr.send(blob);
+  });
+}
+
+/**
+ * Alter Weg als Rueckfallebene: alles als Base64 im JSON-Body an Apps Script.
+ * Bleibt drin, damit die App auch dann laeuft, wenn die Serverseite noch
+ * nicht umgestellt ist.
+ */
+async function uploadViaAppsScript(blob, filename, mimeType, sizeMb) {
+  showLoading(`Wird hochgeladen (Ersatzweg) … (${filename}, ${sizeMb} MB)`);
+
+  const base64 = await blobToBase64(blob);
+
+  const uploadStartedAt = Date.now();
+  const tickInterval = setInterval(() => {
+    const s = Math.round((Date.now() - uploadStartedAt) / 1000);
+    showLoading(`Wird hochgeladen (Ersatzweg) … (${filename}, ${sizeMb} MB, ${s}s)`);
+  }, 1000);
+
+  let parsed;
+  try {
+    parsed = await postJsonToScript({ filename, mimeType, data: base64 }, UPLOAD_TIMEOUT_MS);
+  } finally {
+    clearInterval(tickInterval);
+  }
+
+  const transcription = parsed && parsed.transcription;
+  if (!parsed || parsed.status !== 'ok') {
+    throw new Error((parsed && parsed.message) || 'Upload fehlgeschlagen.');
+  }
+  if (!transcription || transcription.status !== 'processing' || !transcription.fileName) {
+    throw new Error('Hochgeladen, aber Transkription nicht gestartet: ' +
+      ((transcription && transcription.message) || 'unbekannter Fehler'));
+  }
+
+  return transcription;
+}
+
+/** POST von JSON an das Apps Script, mit Timeout und lesbaren Fehlern. */
+async function postJsonToScript(payload, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  let res;
+  try {
+    res = await fetch(SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+  } catch (fetchError) {
+    if (fetchError.name === 'AbortError') {
+      throw new Error(`Zeitüberschreitung nach ${timeoutMs / 1000}s`);
+    }
+    throw fetchError;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(text ? text.slice(0, 200) : 'Leere Antwort vom Server');
   }
 }
 
