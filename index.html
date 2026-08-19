@@ -20,6 +20,9 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   .hint { color: #777; font-size: 0.9rem; margin-top: 2.5rem; }
+  .version { color: #999; font-size: 0.75rem; margin-top: 2rem; line-height: 1.6; }
+  .version .bad { color: #b71c1c; font-weight: bold; }
+  .version .good { color: #1e7e34; }
 </style>
 </head>
 <body>
@@ -27,10 +30,11 @@
   <p>Diese Seite empfängt geteilte Sprachmemos aus dem Google Recorder und schickt sie automatisch zur Transkription.</p>
   <div id="result"></div>
   <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü.</p>
+  <div class="version" id="version"></div>
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v5';
+const CACHE_VERSION = 'transcribe-share-v6';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -370,6 +374,41 @@ function blobToBase64(blob) {
     reader.readAsDataURL(blob);
   });
 }
+
+/**
+ * Fusszeile mit App- und Server-Version.
+ *
+ * Zweck: von aussen erkennen, ob wirklich der neue Stand laeuft. Die
+ * App-Version kommt aus CACHE_VERSION - steht dort noch eine alte Nummer,
+ * hat der Service Worker die Seite noch nicht ersetzt. Der Server sagt
+ * selbst, ob der Direktweg im DEPLOYTEN Code verdrahtet ist; das ist keine
+ * gepflegte Zahl, sondern aus dem laufenden Code abgelesen.
+ *
+ * Waehrend eines Share-Uploads wird bewusst NICHT gefragt: Apps Script
+ * arbeitet Anfragen desselben Nutzers nacheinander ab, die Abfrage wuerde
+ * dem Upload nur Zeit wegnehmen.
+ */
+async function showVersions() {
+  const el = document.getElementById('version');
+  const appVersion = CACHE_VERSION.replace('transcribe-share-', '');
+  const sharing = new URLSearchParams(location.search).has('share');
+
+  el.textContent = `App ${appVersion}`;
+  if (sharing) return;
+
+  try {
+    const res = await fetch(`${SCRIPT_URL}?action=version`);
+    const info = await res.json();
+    const direct = info.directUpload
+      ? '<span class="good">Direktweg aktiv</span>'
+      : '<span class="bad">Direktweg INAKTIV — läuft über den langsamen Ersatzweg</span>';
+    el.innerHTML = `App ${appVersion} · Server ${info.server}<br>${direct}`;
+  } catch (e) {
+    el.innerHTML = `App ${appVersion} · <span class="bad">Server nicht erreichbar</span>`;
+  }
+}
+
+showVersions();
 </script>
 </body>
 </html>
