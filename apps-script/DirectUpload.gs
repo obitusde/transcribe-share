@@ -31,6 +31,16 @@ var DRIVE_RESUMABLE_INIT_URL =
   'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true';
 
 /**
+ * Origins, deren Browser eine Session-URL weiterbenutzen duerfen.
+ *
+ * Der Google-Upload-Server merkt sich den Origin aus dem INIT-Call und
+ * schickt nur dann Access-Control-Allow-Origin auf die Antwort des PUT.
+ * Ohne diesen Eintrag kommen die Bytes zwar an, aber der Browser darf die
+ * Antwort nicht lesen - der Upload sieht wie ein Netzwerkfehler aus.
+ */
+var ALLOWED_UPLOAD_ORIGINS = ['https://obitusde.github.io'];
+
+/**
  * Router fuer die neuen Upload-Actions.
  *
  * Gibt einen fertigen TextOutput zurueck, wenn die Anfrage zu diesem Modul
@@ -88,6 +98,13 @@ function initUpload_(data) {
     'X-Upload-Content-Type': mimeType
   };
   if (data.size) headers['X-Upload-Content-Length'] = String(data.size);
+
+  // Ohne Origin HIER liefert der Upload-Server beim spaeteren PUT kein
+  // Access-Control-Allow-Origin (nur der OPTIONS-Preflight antwortet
+  // korrekt - deshalb sieht der Fehler wie ein reines Netzwerkproblem aus).
+  if (data.origin && ALLOWED_UPLOAD_ORIGINS.indexOf(data.origin) !== -1) {
+    headers['Origin'] = data.origin;
+  }
 
   var res = UrlFetchApp.fetch(DRIVE_RESUMABLE_INIT_URL, {
     method: 'post',
