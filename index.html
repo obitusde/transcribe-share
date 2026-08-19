@@ -35,7 +35,10 @@ const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
 const UPLOAD_TIMEOUT_MS = 90 * 1000; // nur noch fuer den Base64-Ersatzweg
-const HANDSHAKE_TIMEOUT_MS = 30 * 1000; // die winzigen init/complete-Requests
+const HANDSHAKE_TIMEOUT_MS = 30 * 1000; // initUpload: nur Session eroeffnen
+// completeUpload stoesst serverseitig noch den Transkriptionsstart fuer alle
+// wartenden Dateien an (mehrere Drive-Ops + AssemblyAI-Call) - das darf dauern.
+const COMPLETE_TIMEOUT_MS = 2 * 60 * 1000;
 const DIRECT_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000; // Direkt-Upload, grosszuegig fuer schwaches Netz
 
 if ('serviceWorker' in navigator) {
@@ -179,7 +182,7 @@ async function uploadDirectToDrive(blob, filename, mimeType, sizeMb) {
   try {
     done = await postJsonToScript(
       { action: 'completeUpload', fileId: driveFile.id, fileName: init.fileName },
-      HANDSHAKE_TIMEOUT_MS
+      COMPLETE_TIMEOUT_MS
     );
   } catch (e) {
     e.noFallback = true;

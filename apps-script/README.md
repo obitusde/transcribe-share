@@ -1,143 +1,138 @@
 # Apps Script: Einbau des Direkt-Uploads
 
-## Problem
+## Brauchst du alle Dateien im Projekt?
 
-Der bisherige Weg schickte die komplette Aufnahme als Base64-String im
-JSON-Body an `doPost()`. Bei 17 MB Audio sind das ~22,6 MB Text.
+Ja, alle vier — nichts davon ist Altlast:
 
-Messung bei 141,6 Mbit/s Upload und 9 ms Latenz:
-
-| Posten | Zeit |
+| Datei | Rolle |
 |---|---|
-| 22,6 MB über die Leitung | ~1,3 s |
-| TLS-Handshake + Redirect | < 0,2 s |
-| **Rest: Apps Script serverseitig** | **~88 s** |
+| `Code.gs` | Kern: Warteschlange, AssemblyAI-Start, Statusprüfung, Mailversand, Job-State |
+| `checkStatusTrigger.gs` | Einmal-Trigger, der `checkAllPendingStatuses_()` wiederholt aufruft, bis die Mail raus ist |
+| `doPost-diagnose-v1.gs` | Der produktive Upload-Endpoint der PWA. Nur der **Name** ist irreführend, der Inhalt ist nicht Diagnose |
+| `Index.html` | Web-UI mit „Transkription starten"-Button, geladen von `doGet()` |
 
-Dass die restlichen ~88 s serverseitig liegen, lässt sich am alten Client
-ablesen: Sekundenzähler und 90-s-Timeout wurden beide erst **nach**
-`await blobToBase64(blob)` aufgesetzt, haben also ausschließlich die Zeit
-innerhalb von `fetch()` gemessen. Die Zeit verbrennt Apps Script in
-`Utilities.base64Decode()` über einen 22-MB-String plus dem Schreiben nach
-Drive — alles synchron, bevor überhaupt geantwortet wird.
+Dazu kommt jetzt `DirectUpload.gs` als fünfte Datei.
 
-## Lösung
+## Wo die Zeit wirklich hingeht
 
-Apps Script eröffnet nur noch eine Drive-**Resumable-Upload-Session** und gibt
-deren URL zurück. Die Bytes schiebt der Browser als rohes Binary direkt zu
-Google. Apps Script sieht danach nur noch winzige JSON-Nachrichten.
+Der alte `doPost()` macht **zwei** teure Dinge synchron, bevor er antwortet:
+
+1. `Utilities.base64Decode()` über ~22,6 MB Text plus `folder.createFile()`
+   mit dem 17-MB-Blob.
+2. `startAllPendingTranscriptions_()` für **alle** wartenden Dateien — pro
+   Datei mehrere Drive-Roundtrips (Ordner scannen, umbenennen,
+   `ensureUniqueFileName_`, `getJobState`, `saveJobState` mit Rück-Lesen und
+   Retry-Sleeps von 2–6 s) plus ein AssemblyAI-API-Call.
+
+Bei 141,6 Mbit/s Upload und 9 ms Latenz gehen von den ~90 s bis zum Timeout
+nur ~1,3 s auf die Übertragung. Der Rest ist Punkt 1 + Punkt 2.
+
+## Was sich ändert
+
+Punkt 1 fällt komplett weg: der Browser schiebt die Bytes als rohes Binary
+direkt in eine Drive-**Resumable-Upload-Session**.
+
+Punkt 2 bleibt bewusst synchron, nur eben ohne die Dekodierung davor. Das
+ist Absicht — die Antwort muss weiterhin den **normalisierten** Dateinamen
+enthalten, auf den die PWA ihr Status-Polling stützt. Der Teil kostet
+Sekunden, nicht Minuten.
 
 ```
-Browser ──{action:'initUpload'}──────────► Apps Script
-Browser ◄─{uploadUrl, fileName}────────── Apps Script   (winzig)
+Browser ──{action:'initUpload'}──────────► Apps Script  (winzig)
+Browser ◄─{uploadUrl, fileName}────────── Apps Script
 Browser ──PUT 17 MB raw binary──────────► Drive API     (schnell, direkt)
 Browser ──{action:'completeUpload'}─────► Apps Script
-Browser ◄─{transcription:'processing'}─── Apps Script   (winzig)
-Browser ──GET ?action=status (Polling)──► Apps Script   (unverändert)
+                                          └─ startAllPendingTranscriptions_()
+                                          └─ scheduleAutoCheck()
+Browser ◄─{transcription:{fileName}}───── Apps Script
+Browser ──GET ?action=status (Polling)──► Apps Script  (unverändert)
 ```
 
-Der OAuth-Token des Skripts wird dabei **nie** an den Browser gegeben. Die
-Session-URL ist ein kurzlebiges Capability-Token für genau diese eine Datei.
+Der OAuth-Token des Skripts bleibt serverseitig — der Browser bekommt nur die
+kurzlebige Session-URL für genau diese eine Datei.
 
-## Einbau
+## Einbau — nur 2 Handgriffe
 
-### Schritt 1 — Neue Skriptdatei anlegen
+### Schritt 1 — Neue Datei anlegen
 
-Im Apps-Script-Editor eine **neue** Datei `DirectUpload` anlegen und den
-Inhalt von `DirectUpload.gs` hineinkopieren.
+Im Editor eine **neue** Skriptdatei `DirectUpload` anlegen und den Inhalt von
+`DirectUpload.gs` einfügen.
 
-> Die bestehende `Code.gs` **nicht** überschreiben. Die neue Datei definiert
-> bewusst weder `doPost` noch `doGet`, damit nichts kollidiert.
+Die Datei definiert bewusst **weder `doPost` noch `doGet`**, damit nichts mit
+`Code.gs` oder `doPost-diagnose-v1.gs` kollidiert. Sie benutzt `CONFIG`,
+`startAllPendingTranscriptions_()`, `scheduleAutoCheck()` und
+`jsonResponse_()` aus den bestehenden Dateien.
 
-Falls die Dateien in einem bestimmten Drive-Ordner landen sollen: oben in
-`DirectUpload.gs` die `UPLOAD_FOLDER_ID` setzen (leer = Drive-Wurzel).
+### Schritt 2 — Zwei Zeilen in `doPost-diagnose-v1.gs`
 
-### Schritt 2 — Zwei Zeilen in die bestehende `doPost()`
+Ganz am Anfang von `doPost(e)`, direkt hinter `try {`:
 
 ```js
 function doPost(e) {
-  var routed = handleUploadAction_(e);   // ← NEU, ganz oben
-  if (routed) return routed;             // ← NEU
+  try {
+    var routed = handleUploadAction_(e);   // ← NEU
+    if (routed) return routed;             // ← NEU
 
-  // ... bestehender Base64-Code bleibt unverändert stehen ...
-}
+    if (!e || !e.postData || !e.postData.contents) {
+      // ... alles Weitere bleibt unverändert ...
 ```
 
-`handleUploadAction_()` gibt `null` zurück, wenn die Anfrage keine
-`action` enthält. Der alte Pfad läuft dadurch unangetastet weiter — wichtig,
-weil der neue Client bei Problemen automatisch darauf zurückfällt.
+`handleUploadAction_()` gibt `null` zurück, wenn im Body keine `action`
+steht. Der alte Base64-Pfad bleibt damit voll funktionsfähig — wichtig, weil
+der neue Client bei Problemen automatisch darauf zurückfällt.
 
-### Schritt 3 — Transkription anschließen
+### Schritt 3 — Deployen
 
-In `DirectUpload.gs` wirft `startTranscriptionForDriveFile_()` aktuell
-absichtlich einen Fehler. Dort gehört der Code hin, der in der alten
-`doPost()` **direkt hinter** `DriveApp.createFile(...)` stand:
+Bereitstellen → Bereitstellungen verwalten → Stift → Version: **Neue
+Version** → Bereitstellen.
 
-```js
-function startTranscriptionForDriveFile_(fileId, fileName) {
-  var file = DriveApp.getFileById(fileId);
+Die `exec`-URL liefert die **deployte** Version, nicht den gespeicherten
+Editor-Stand. Ohne diesen Schritt ändert sich nichts. Die URL bleibt gleich,
+die PWA braucht keine Anpassung.
 
-  // ... vorhandener Transkriptions-Aufruf mit "file" ...
-  // ... vorhandenes MailApp.sendEmail(...) ...
+## Was ausdrücklich NICHT angefasst wird
 
-  setTranscriptionState_(fileName, 'done');   // oder 'error' im Fehlerfall
-}
-```
+- **Statusverwaltung.** `getUploadStatus_()` leitet den Zustand aus Drive ab
+  (Datei im Archiv → `done`, Job-State-Datei vorhanden → `transcribing`,
+  Datei noch im Arbeitsordner → `error`). `DirectUpload.gs` schreibt bewusst
+  keinen eigenen Statusspeicher — das würde an dieser Logik vorbeilaufen.
+- **Dateinamen.** Das Umbenennen auf `YYYY-MM-DD_HH-mm-ss.ext` macht
+  weiterhin `startTranscriptionForFile_()`. Der Upload legt die Datei unter
+  dem Originalnamen im Arbeitsordner ab, damit nicht zwei Namenslogiken
+  gegeneinander laufen.
+- **Mailversand, AssemblyAI-Aufruf, Trigger-Kette.** Unverändert.
 
-**Wichtig:** am Ende immer den Status setzen, sonst pollt der Client bis zum
-Timeout ins Leere.
+## Scopes
 
-### Schritt 4 — Statusspeicher abgleichen
-
-`DirectUpload.gs` bringt eine eigene `setTranscriptionState_()` /
-`getTranscriptionState_()` auf Basis von `PropertiesService` mit.
-
-**Wenn im bestehenden Skript bereits eine Statusverwaltung existiert** (die
-`doGet(?action=status)` bedient), dann die beiden Funktionen in
-`DirectUpload.gs` löschen und stattdessen die vorhandenen verwenden. Sonst
-schreiben zwei Speicher aneinander vorbei und das Polling sieht nie ein
-`done`.
-
-### Schritt 5 — Scopes prüfen
-
-`ScriptApp.getOAuthToken()` liefert nur die Scopes, die das Projekt bereits
-hat. Der Aufruf der Drive-REST-API über `UrlFetchApp` fügt den Drive-Scope
-**nicht** automatisch hinzu. In `appsscript.json` (Editor → Projekt­einstellungen
-→ „appsscript.json-Manifestdatei im Editor anzeigen") sicherstellen:
+Neu hinzu kommt ein `UrlFetchApp`-Aufruf gegen `googleapis.com` mit
+`ScriptApp.getOAuthToken()`. Beide nötigen Scopes hat das Projekt durch
+`DriveApp` und die bestehenden AssemblyAI-Calls bereits — es sollte also
+keine neue Freigabe nötig sein. Falls Drive den Init-Call trotzdem mit
+HTTP 401/403 ablehnt, in `appsscript.json` ergänzen:
 
 ```json
 "oauthScopes": [
   "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/script.external_request",
-  "https://www.googleapis.com/auth/script.send_mail"
+  "https://www.googleapis.com/auth/gmail.send"
 ]
 ```
 
-Nach einer Scope-Änderung muss die Autorisierung einmal neu bestätigt werden.
-
-### Schritt 6 — Neu deployen (der klassische Stolperstein)
-
-Die `exec`-URL liefert **die deployte Version, nicht den gespeicherten
-Editor-Stand**. Also:
-
-Bereitstellen → Bereitstellungen verwalten → Stift-Symbol →
-Version: **Neue Version** → Bereitstellen
-
-Die `exec`-URL bleibt dabei gleich, der Client braucht keine Änderung.
+Danach einmal neu autorisieren.
 
 ## Rückfallebene
 
 Der Client versucht immer zuerst den Direktweg. Schlägt `initUpload` fehl
-(z. B. weil Schritt 6 noch nicht gemacht wurde) oder scheitert der PUT an
-CORS, wechselt er automatisch auf den alten Base64-Weg und zeigt das als
-„Ersatzweg" an. Die App wird dadurch zu keinem Zeitpunkt unbenutzbar.
+(z. B. weil Schritt 3 noch aussteht) oder scheitert der PUT an CORS, wechselt
+er automatisch auf den alten Base64-Weg und zeigt „Ersatzweg" an. Die App
+wird zu keinem Zeitpunkt unbenutzbar.
 
-Sobald der Direktweg läuft, zeigt die Seite echten Fortschritt in Prozent
-und MB/s — bei 17 MB und deiner Leitung sollten das wenige Sekunden sein.
+Läuft der Direktweg, zeigt die Seite echten Fortschritt in Prozent und MB/s.
 
 ## Nicht getestet
 
-Der Direkt-Upload ist hier nicht real erprobt worden: die Umgebung, in der
-dieser Code entstanden ist, hat keinen Netzzugang zu `script.google.com` oder
-`googleapis.com`, und der Ablauf startet ohnehin erst über das Android-Share-
-Target. Der wahrscheinlichste Stolperstein ist CORS beim PUT auf die
-Session-URL — genau dafür ist die Rückfallebene eingebaut.
+Der Direkt-Upload ist nicht real erprobt: die Umgebung, in der dieser Code
+entstand, hat keinen Netzzugang zu `script.google.com` oder `googleapis.com`,
+und der Ablauf startet ohnehin erst über das Android-Share-Target. Der
+wahrscheinlichste Stolperstein ist CORS beim PUT auf die Session-URL — genau
+dafür ist die Rückfallebene eingebaut.
