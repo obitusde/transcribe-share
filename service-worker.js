@@ -1,5 +1,5 @@
 // service-worker.js
-// Version: 11 (2026-09-10)
+// Version: 12 (2026-09-10)
 // Faengt den Web-Share-Target-POST ab, reicht die geteilte Datei an die Seite
 // weiter und leitet SOFORT dorthin um (statt den kompletten Upload
 // abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
@@ -24,7 +24,7 @@
 //      "Chrome konnte es nicht parsen", was von aussen sonst identisch
 //      aussieht.
 
-const CACHE_VERSION = 'transcribe-share-v11';
+const CACHE_VERSION = 'transcribe-share-v12';
 const SHARE_CACHE_KEY = './__shared-file__'; // nur noch fuer Altlasten
 const IDB_NAME = 'transcribe-share';
 const IDB_STORE = 'shares';
@@ -119,11 +119,26 @@ async function handleShareTarget(event) {
       file = parseMultipartFromBytes(rawBytes, contentType);
 
       if (!file) {
+        // Ausfuehrlich in die Konsole, damit ein DevTools-Blick auf den
+        // Service Worker mehr hergibt als der kurze Text auf der Seite.
+        console.error('[share-target] Keine Datei im POST.');
+        console.log('[share-target] Content-Type:', contentType);
+        console.log('[share-target] Content-Length-Header:', contentLength);
+        console.log('[share-target] tatsaechlich gelesen:', rawBytes ? rawBytes.length : 'null', 'Bytes');
+        console.log('[share-target] formData()-Fehler:', formDataError || 'keiner');
+        console.log('[share-target] Felder:', formData ? describeEntries(formData) : 'keine FormData');
+        console.log('[share-target] Body als Text:',
+          rawBytes ? new TextDecoder().decode(rawBytes.subarray(0, 2000)) : '(nichts)');
+
         return redirectWithError(
           buildFailureReport(formData, formDataError, contentType, contentLength, rawBytes)
         );
       }
+
+      console.warn('[share-target] formData() lieferte nichts, eigener Parser hat die Datei gerettet.');
     }
+
+    console.log('[share-target] Datei erkannt:', file.name, '|', file.type, '|', file.size, 'Bytes');
 
     const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
     PENDING_SHARES.set(token, file);
