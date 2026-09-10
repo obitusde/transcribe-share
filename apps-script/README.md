@@ -156,6 +156,29 @@ Seit v7 läuft der Upload in 4-MiB-Chunks (`putChunk_`):
   wirklich verloren) gibt es endgültig auf, und der Client fällt auf den
   Base64-Ersatzweg zurück.
 
+## Datei-Übergabe ohne Cache API (seit App-Version v8)
+
+Bis v7 hat der Service Worker die geteilte Datei per `cache.put()` in die
+Cache API gelegt und die Seite hat sie dort wieder herausgeholt. Bei einer
+56-minütigen Aufnahme lief das in einen `QuotaExceededError` — und Chrome
+liefert bei dieser DOMException eine **leere `.message`**. Der Service
+Worker hat nur `error.message` weitergereicht, die Seite zeigte deshalb ein
+nacktes „Fehler beim Hochladen" ohne jede Detailzeile, und der komplette
+Upload-Code wurde nie erreicht. Das Chunking aus v7 konnte daran
+nichts ändern, weil es nie zur Ausführung kam.
+
+Seit v8 wandert die File-Referenz direkt per `postMessage` vom Service
+Worker an die Seite. Das kopiert nichts und verbraucht keine Quota — das
+File-Objekt ist nur ein Handle auf die Datei, die Android ohnehin auf der
+Platte liegen hat. Als Absicherung (falls der Service Worker zwischen
+Redirect und Seitenaufbau beendet wird) schreibt er zusätzlich im
+Hintergrund nach IndexedDB; scheitert das, ist es folgenlos.
+
+Zusätzlich liefert `describeError()` auf beiden Seiten jetzt **nie** einen
+leeren Text: fehlt die `.message`, wird der `.name` der Exception angezeigt.
+Genau diese Zeile hat vorher gefehlt, um das Problem überhaupt sehen zu
+können.
+
 ## Getestet
 
 Der Direktweg lief in der Praxis bereits erfolgreich (bestätigt über den

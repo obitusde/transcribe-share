@@ -34,7 +34,7 @@
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v7';
+const CACHE_VERSION = 'transcribe-share-v8';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -69,11 +69,12 @@ const params = new URLSearchParams(location.search);
 const status = params.get('status');
 const message = params.get('message');
 const sharePending = params.get('share') === 'pending';
+const shareToken = params.get('token');
 
 if (sharePending) {
   history.replaceState({}, '', location.pathname);
   showLoading('Geteilte Datei wird verarbeitet …');
-  handleSharedFile();
+  handleSharedFile(shareToken);
 } else if (status) {
   history.replaceState({}, '', location.pathname);
   showResult(status, message);
@@ -119,20 +120,18 @@ function resumePendingIfAny() {
   }
 }
 
-async function handleSharedFile() {
+async function handleSharedFile(token) {
   try {
-    const cache = await caches.open(CACHE_VERSION);
-    const cached = await cache.match(SHARE_CACHE_KEY);
+    const shared = await getSharedFile(token);
 
-    if (!cached) {
-      showResult('error', 'Keine geteilte Datei im Zwischenspeicher gefunden.');
+    if (!shared) {
+      showResult('error', '', '❌ Die geteilte Datei war nicht mehr auffindbar. Bitte die Aufnahme noch einmal teilen.');
       return;
     }
 
-    const filename = decodeURIComponent(cached.headers.get('X-Shared-Filename') || 'share-upload.m4a');
-    const mimeType = cached.headers.get('Content-Type') || 'audio/mp4';
-    const blob = await cached.blob();
-    await cache.delete(SHARE_CACHE_KEY);
+    const filename = shared.name || 'share-upload.m4a';
+    const mimeType = shared.type || 'audio/mp4';
+    const blob = shared.blob;
 
     localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify({ startedAt: Date.now() }));
 
@@ -146,7 +145,7 @@ async function handleSharedFile() {
       transcription = await uploadDirectToDrive(blob, filename, mimeType, sizeMb);
     } catch (directError) {
       if (directError.noFallback) throw directError;
-      showLoading(`Direkter Upload nicht verfügbar (${directError.message}) — nutze Ersatzweg …`);
+      showLoading(`Direkter Upload nicht verfügbar (${describeError(directError)}) — nutze Ersatzweg …`);
       transcription = await uploadViaAppsScript(blob, filename, mimeType, sizeMb);
     }
 
@@ -158,8 +157,123 @@ async function handleSharedFile() {
 
   } catch (error) {
     localStorage.removeItem(IN_PROGRESS_KEY);
-    showResult('error', error.message);
+    showResult('error', describeError(error));
   }
+}
+
+/**
+ * Fehlertext, der NIE leer ist.
+ *
+ * Genau daran ist die Diagnose vorher gescheitert: DOMExceptions wie
+ * QuotaExceededError haben in Chrome einen aussagekraeftigen .name, aber
+ * eine leere .message - angezeigt wurde deshalb nur die generische
+ * Ueberschrift ohne jeden Hinweis auf die Ursache.
+ */
+function describeError(error) {
+  if (!error) return 'Unbekannter Fehler (kein Fehlerobjekt).';
+  if (typeof error === 'string') return error;
+  const name = error.name || 'Error';
+  const message = error.message || '(keine Meldung)';
+  return name === 'Error' ? message : `${name}: ${message}`;
+}
+
+/**
+ * Holt die geteilte Datei ab - drei Wege, in dieser Reihenfolge:
+ *
+ *  1. Direkt vom Service Worker per postMessage. Das ist der Normalfall und
+ *     kopiert nichts: das File-Objekt ist nur ein Handle auf die Datei, die
+ *     Android ohnehin auf der Platte hat.
+ *  2. IndexedDB - falls der Service Worker zwischen Redirect und Seiten-
+ *     aufbau beendet wurde.
+ *  3. Cache API unter den alten Versionsschluesseln - nur fuer eine Datei,
+ *     die eine aeltere App-Version noch dort abgelegt hat.
+ */
+async function getSharedFile(token) {
+  if (token) {
+    const viaSw = await requestFileFromServiceWorker(token).catch(() => null);
+    if (viaSw) return viaSw;
+
+    const viaIdb = await readShareFromIdb(token).catch(() => null);
+    if (viaIdb) return viaIdb;
+  }
+
+  return readLegacyCachedShare();
+}
+
+function requestFileFromServiceWorker(token) {
+  return new Promise((resolve, reject) => {
+    const worker = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if (!worker) {
+      reject(new Error('Kein aktiver Service Worker'));
+      return;
+    }
+
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => reject(new Error('Service Worker antwortete nicht')), 5000);
+
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      const data = event.data;
+      if (data && data.ok && data.file) {
+        resolve({ blob: data.file, name: data.name, type: data.type });
+      } else {
+        reject(new Error('Service Worker hat die Datei nicht mehr'));
+      }
+    };
+
+    worker.postMessage({ type: 'claim-share', token }, [channel.port2]);
+  });
+}
+
+function readShareFromIdb(token) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('transcribe-share', 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('shares')) db.createObjectStore('shares');
+    };
+    request.onerror = () => reject(request.error || new Error('IndexedDB nicht verfügbar'));
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('shares', 'readwrite');
+      const store = tx.objectStore('shares');
+      const getRequest = store.get(token);
+
+      getRequest.onsuccess = () => {
+        const record = getRequest.result;
+        if (record && record.file) {
+          store.delete(token);
+          resolve({ blob: record.file, name: record.name, type: record.type });
+        } else {
+          reject(new Error('Datei nicht in IndexedDB'));
+        }
+      };
+      getRequest.onerror = () => reject(getRequest.error);
+    };
+  });
+}
+
+/** Altlast: Datei, die eine aeltere App-Version noch in der Cache API abgelegt hat. */
+async function readLegacyCachedShare() {
+  const legacyKeys = [CACHE_VERSION, 'transcribe-share-v7', 'transcribe-share-v6'];
+
+  for (const key of legacyKeys) {
+    try {
+      const cache = await caches.open(key);
+      const cached = await cache.match(SHARE_CACHE_KEY);
+      if (!cached) continue;
+      await cache.delete(SHARE_CACHE_KEY);
+      return {
+        blob: await cached.blob(),
+        name: decodeURIComponent(cached.headers.get('X-Shared-Filename') || 'share-upload.m4a'),
+        type: cached.headers.get('Content-Type') || 'audio/mp4'
+      };
+    } catch (e) {
+      // Naechsten Schluessel versuchen.
+    }
+  }
+
+  return null;
 }
 
 /**
