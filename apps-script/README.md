@@ -179,6 +179,33 @@ leeren Text: fehlt die `.message`, wird der `.name` der Exception angezeigt.
 Genau diese Zeile hat vorher gefehlt, um das Problem überhaupt sehen zu
 können.
 
+## Stand zum Share-Target-Problem (10.09.2026)
+
+Gesichert, jeweils nachgemessen statt vermutet:
+
+- Der POST erreicht den Service Worker, enthält aber **null Teile**. Gemessen:
+  75 Bytes Body bei einem 69 Zeichen langen Boundary — exakt die Länge des
+  Multipart-Abschlussmarkers (`--` + Boundary + `--` + CRLF).
+- `formData()` arbeitet korrekt; es ist schlicht nichts da. Auch ein eigener
+  Byte-Parser findet nichts.
+- Die Meldung erscheint **sofort** — die Datei wird nie gelesen.
+- **Eine 10-Sekunden-Aufnahme scheitert identisch.** Damit sind Dateigröße
+  und Aufnahmedauer als Ursache ausgeschlossen.
+- Ein Verbreitern des `accept`-Filters plus Neuinstallation der PWA änderte
+  nichts.
+
+Widerlegt wurden unterwegs: Cache-Quota (21 MB ist viel zu klein), der
+`accept`-Filter, und ein defektes `formData()`. Der Fehler entsteht im
+Übergang Android → Chrome → WebAPK, bevor eine Zeile dieses Projekts läuft,
+und ist von innerhalb der PWA nicht behebbar.
+
+Noch nicht geprüft: der Eintrag unter `chrome://webapks` auf dem Gerät
+(zeigt, ob Android die aktuelle Manifest-Fassung übernommen hat) und ob das
+Teilen aus einer anderen App als dem Google Recorder funktioniert.
+
+Der Weg über die Drive-App (siehe unten) ist davon nicht betroffen und läuft
+zuverlässig.
+
 ## Manueller Weg über Drive (wenn das Teilen scheitert)
 
 Der Android-Share-Target liefert die Aufnahme zeitweise nicht aus: der POST
