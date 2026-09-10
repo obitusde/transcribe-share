@@ -1,5 +1,5 @@
 // service-worker.js
-// Version: 8 (2026-09-10)
+// Version: 9 (2026-09-10)
 // Faengt den Web-Share-Target-POST ab, reicht die geteilte Datei an die Seite
 // weiter und leitet SOFORT dorthin um (statt den kompletten Upload
 // abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
@@ -23,7 +23,7 @@
 // beendet wird, wird zusaetzlich im Hintergrund nach IndexedDB geschrieben -
 // scheitert das, ist es egal, solange der Speicherweg traegt.
 
-const CACHE_VERSION = 'transcribe-share-v8';
+const CACHE_VERSION = 'transcribe-share-v9';
 const SHARE_CACHE_KEY = './__shared-file__'; // nur noch fuer Altlasten
 const IDB_NAME = 'transcribe-share';
 const IDB_STORE = 'shares';
@@ -94,10 +94,10 @@ self.addEventListener('fetch', (event) => {
 async function handleShareTarget(event) {
   try {
     const formData = await event.request.formData();
-    const file = formData.get('audio');
+    const file = pickSharedFile(formData);
 
     if (!file) {
-      return redirectWithError('Keine Datei empfangen.');
+      return redirectWithError(describeEmptyShare(formData));
     }
 
     const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
@@ -116,6 +116,55 @@ async function handleShareTarget(event) {
 
 function redirectWithError(message) {
   return Response.redirect('./?status=error&message=' + encodeURIComponent(message), 303);
+}
+
+/**
+ * Nimmt die erste echte Datei aus dem Formular, egal unter welchem Feldnamen.
+ *
+ * Verlaesst sich bewusst nicht mehr allein auf "audio": liefert Android die
+ * Datei unter einem anderen Namen, landete sie vorher stillschweigend im
+ * Nichts. Dateien mit 0 Bytes werden ebenfalls abgelehnt - die wuerden sonst
+ * als leere Aufnahme in Drive landen und eine sinnlose Transkription starten.
+ */
+function pickSharedFile(formData) {
+  const named = formData.get('audio');
+  if (named && typeof named !== 'string' && named.size > 0) return named;
+
+  for (const value of formData.values()) {
+    if (value && typeof value !== 'string' && value.size > 0) return value;
+  }
+
+  return null;
+}
+
+/**
+ * Sagt, WAS statt der Datei ankam.
+ *
+ * Ohne das steht nur "Keine Datei empfangen." da, und es bleibt offen, ob
+ * Android gar nichts geschickt hat, eine leere Datei, oder nur Text (etwa
+ * weil versehentlich das Transkript statt der Aufnahme geteilt wurde).
+ */
+function describeEmptyShare(formData) {
+  const parts = [];
+
+  for (const entry of formData.entries()) {
+    const key = entry[0];
+    const value = entry[1];
+    if (typeof value === 'string') {
+      parts.push(key + '="' + value.slice(0, 60) + '"');
+    } else {
+      parts.push(key + '=Datei(' + (value.type || 'ohne Typ') + ', ' + value.size + ' Bytes)');
+    }
+  }
+
+  if (parts.length === 0) {
+    return 'Keine Datei empfangen - das Formular kam komplett leer an. ' +
+      'Meist heisst das, dass Android die Datei wegen des accept-Filters ' +
+      'verworfen hat; dann hilft nur, die App vom Homescreen zu entfernen ' +
+      'und neu hinzuzufuegen.';
+  }
+
+  return 'Keine verwertbare Datei empfangen. Angekommen ist: ' + parts.join(', ');
 }
 
 /**

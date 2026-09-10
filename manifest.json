@@ -19,10 +19,26 @@
     "method": "POST",
     "enctype": "multipart/form-data",
     "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
       "files": [
         {
           "name": "audio",
-          "accept": ["audio/*"]
+          "accept": [
+            "audio/*",
+            "video/mp4",
+            "application/octet-stream",
+            ".m4a",
+            ".mp3",
+            ".wav",
+            ".ogg",
+            ".aac",
+            ".opus",
+            ".mp4",
+            ".3gp",
+            ".amr"
+          ]
         }
       ]
     }
