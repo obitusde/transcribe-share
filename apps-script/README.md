@@ -179,6 +179,54 @@ leeren Text: fehlt die `.message`, wird der `.name` der Exception angezeigt.
 Genau diese Zeile hat vorher gefehlt, um das Problem überhaupt sehen zu
 können.
 
+## Manueller Weg über Drive (wenn das Teilen scheitert)
+
+Der Android-Share-Target liefert die Aufnahme zeitweise nicht aus: der POST
+kommt mit einem leeren Multipart-Body an (nachgewiesen — 75 Bytes, exakt die
+Länge des Abschlussmarkers, null Teile). Das passiert im Übergang
+Android → Chrome → WebAPK und ist aus der PWA heraus nicht behebbar.
+
+Der Auswahl-Button in der PWA hilft dabei **nicht**, wenn die Quelle der
+Google Recorder ist: dessen Aufnahmen liegen im app-privaten Speicher und
+erscheinen im System-Auswahldialog gar nicht.
+
+Was stattdessen funktioniert, ohne jede Codeänderung:
+
+1. Im Recorder die Aufnahme teilen → **Drive** wählen (die native Drive-App,
+   nicht die PWA). Das ist ein ganz anderer Weg als der Web-Share-Target und
+   von dessen Problem nicht betroffen.
+2. Als Zielordner `Transcription-Arbeit` wählen (der Ordner aus
+   `CONFIG.FOLDER_WORK_NAME`).
+3. Die Apps-Script-Weboberfläche öffnen — das ist die `exec`-URL **ohne**
+   Parameter. `doGet()` liefert dort `Index.html` aus.
+4. Auf **„Transkription starten"** tippen.
+
+`startTranscriptionWorkflow()` nimmt die neueste Datei aus dem
+Arbeitsordner, und die Warteschlange auf der Seite zeigt, was sonst noch
+ansteht.
+
+### Lücke dabei: die Mail bleibt aus, wenn die Seite geschlossen wird
+
+`startTranscriptionWorkflow()` ruft **kein** `scheduleAutoCheck()` auf — im
+Gegensatz zu `doPost()` bzw. `completeUpload_()`. Ohne diesen Trigger gibt es
+keinen serverseitigen Status-Check; abgeschlossen (und damit die Mail
+versendet) wird die Transkription nur durch das 15-Sekunden-Polling der
+geöffneten Weboberfläche. Wer die Seite zumacht, bekommt keine E-Mail, und
+die Datei bleibt im Arbeitsordner liegen.
+
+Ein Einzeiler in `Code.gs` behebt das — in `startTranscriptionWorkflow()`,
+direkt vor dem `return`:
+
+```js
+    const result = startTranscriptionForFile_(latestFile);
+    if (result.status === 'processing') scheduleAutoCheck();   // ← NEU
+    return Object.assign({}, result, { pending: buildPendingList() });
+```
+
+Danach `clasp push` und neu deployen (`clasp deploy -i <deploymentId>`).
+Ab dann verhält sich der manuelle Weg wie der Upload über die PWA: die Mail
+kommt automatisch, egal ob die Seite offen bleibt.
+
 ## Getestet
 
 Der Direktweg lief in der Praxis bereits erfolgreich (bestätigt über den
