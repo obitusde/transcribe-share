@@ -34,7 +34,7 @@
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v6';
+const CACHE_VERSION = 'transcribe-share-v7';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -43,7 +43,17 @@ const HANDSHAKE_TIMEOUT_MS = 30 * 1000; // initUpload: nur Session eroeffnen
 // completeUpload stoesst serverseitig noch den Transkriptionsstart fuer alle
 // wartenden Dateien an (mehrere Drive-Ops + AssemblyAI-Call) - das darf dauern.
 const COMPLETE_TIMEOUT_MS = 2 * 60 * 1000;
-const DIRECT_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000; // Direkt-Upload, grosszuegig fuer schwaches Netz
+// Der Direkt-Upload laeuft in Chunks statt in einem einzigen PUT ueber die
+// ganze Datei. Grund: ein monolithischer PUT hatte EIN Timeout und KEINEN
+// Retry - bei kurzen Testdateien (Sekunden Uebertragungszeit) fiel das nicht
+// auf, bei einer 56-Minuten-Aufnahme (viele Minuten Uebertragungszeit auf dem
+// Handy) reisst ein einziger kurzer Netzwackler (WLAN<->LTE-Wechsel, Screen-
+// Lock) den kompletten Upload ab, ohne jede Chance auf Fortsetzung.
+// Chunk-Groesse muss laut Drive-API ein Vielfaches von 256 KiB sein.
+const UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB
+const CHUNK_TIMEOUT_MS = 4 * 60 * 1000; // pro Chunk, nicht fuer die ganze Datei
+const CHUNK_MAX_RETRIES = 5;
+const CHUNK_RETRY_BASE_DELAY_MS = 1000;
 
 if ('serviceWorker' in navigator) {
   // .update() erzwingt eine sofortige Pruefung auf eine neue Service-Worker-
@@ -208,45 +218,132 @@ async function uploadDirectToDrive(blob, filename, mimeType, sizeMb) {
   return transcription;
 }
 
-/** PUT der Rohdaten an die Drive-Session-URL, mit echter Fortschrittsanzeige. */
-function putBlobWithProgress(uploadUrl, blob, mimeType, sizeMb) {
+/**
+ * PUT der Rohdaten in Chunks an die Drive-Session-URL.
+ *
+ * Nutzt die Resumable-Upload-Session tatsaechlich als das, was sie ist:
+ * bricht ein Chunk ab (Netzwerkfehler, Timeout), wird zuerst der Chunk selbst
+ * ein paar Mal mit Backoff wiederholt; scheitert das endgueltig, fragt
+ * queryUploadStatus_() beim Server nach, wie viele Bytes tatsaechlich schon
+ * angekommen sind, und der Upload macht dort weiter - statt bei jedem
+ * Wackler die ganze (womoeglich sehr grosse) Datei neu zu senden oder den
+ * Upload komplett als gescheitert zu melden.
+ */
+async function putBlobWithProgress(uploadUrl, blob, mimeType, sizeMb) {
+  const total = blob.size;
+  let offset = 0;
+  const startedAt = Date.now();
+
+  while (offset < total) {
+    const end = Math.min(offset + UPLOAD_CHUNK_SIZE, total);
+    let result;
+    try {
+      result = await putChunk_(uploadUrl, blob.slice(offset, end), mimeType, offset, end, total);
+    } catch (chunkError) {
+      const status = await queryUploadStatus_(uploadUrl, total);
+      if (!status) throw chunkError; // Session verloren -> kein Resume moeglich.
+      if (status.done) return status.file;
+      offset = status.offset;
+      continue;
+    }
+
+    if (result.done) return result.file;
+    offset = result.nextOffset;
+
+    const elapsedSec = Math.max(0.1, (Date.now() - startedAt) / 1000);
+    const mbps = (offset / 1024 / 1024) / elapsedSec;
+    const pct = Math.round(offset / total * 100);
+    showLoading(`Wird hochgeladen … ${pct}% (${sizeMb} MB, ${mbps.toFixed(1)} MB/s)`);
+  }
+}
+
+/** Ein Chunk, mit Retry bei Netzwerkfehlern und 5xx-Antworten. */
+function putChunk_(uploadUrl, chunk, mimeType, start, end, total) {
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('PUT', uploadUrl, true);
-    xhr.setRequestHeader('Content-Type', mimeType);
-    xhr.timeout = DIRECT_UPLOAD_TIMEOUT_MS;
+    let attempt = 0;
 
-    const startedAt = Date.now();
+    function tryOnce() {
+      attempt++;
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', uploadUrl, true);
+      xhr.setRequestHeader('Content-Type', mimeType);
+      xhr.setRequestHeader('Content-Range', `bytes ${start}-${end - 1}/${total}`);
+      xhr.timeout = CHUNK_TIMEOUT_MS;
 
-    // fetch() kennt keinen Upload-Fortschritt - daher hier bewusst XHR:
-    // bei 17 MB ist der Unterschied zwischen "haengt" und "laeuft" sichtbar.
-    xhr.upload.onprogress = (ev) => {
-      if (!ev.lengthComputable) return;
-      const pct = Math.round(ev.loaded / ev.total * 100);
-      const secs = Math.max(0.1, (Date.now() - startedAt) / 1000);
-      const mbps = (ev.loaded / 1024 / 1024) / secs;
-      showLoading(`Wird hochgeladen … ${pct}% (${sizeMb} MB, ${mbps.toFixed(1)} MB/s)`);
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText));
-        } catch (e) {
-          reject(new Error('Drive-Antwort war unlesbar'));
+      const retryOrFail = (message) => {
+        if (attempt < CHUNK_MAX_RETRIES) {
+          setTimeout(tryOnce, CHUNK_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+          return;
         }
-        return;
-      }
-      reject(new Error(`Drive antwortete HTTP ${xhr.status}`));
-    };
+        reject(new Error(message));
+      };
 
-    xhr.onerror = () => reject(new Error('Netzwerk- oder CORS-Fehler'));
-    xhr.ontimeout = () => reject(new Error(`Timeout nach ${DIRECT_UPLOAD_TIMEOUT_MS / 1000}s`));
+      xhr.onload = () => {
+        if (xhr.status === 200 || xhr.status === 201) {
+          try {
+            resolve({ done: true, file: JSON.parse(xhr.responseText) });
+          } catch (e) {
+            reject(new Error('Drive-Antwort war unlesbar'));
+          }
+          return;
+        }
+        if (xhr.status === 308) {
+          resolve({ done: false, nextOffset: end });
+          return;
+        }
+        if (xhr.status >= 500) {
+          retryOrFail(`Drive antwortete wiederholt HTTP ${xhr.status}`);
+          return;
+        }
+        reject(new Error(`Drive antwortete HTTP ${xhr.status}: ${(xhr.responseText || '').slice(0, 200)}`));
+      };
 
-    xhr.send(blob);
+      xhr.onerror = () => retryOrFail('Netzwerkfehler beim Hochladen dieses Abschnitts');
+      xhr.ontimeout = () => retryOrFail(`Zeitüberschreitung nach ${CHUNK_TIMEOUT_MS / 1000}s bei diesem Abschnitt`);
+
+      xhr.send(chunk);
+    }
+
+    tryOnce();
   });
 }
 
+/**
+ * Fragt beim Server nach, wie viele Bytes der Upload-Session tatsaechlich
+ * schon angekommen sind (offizieller Weg laut Drive-Resumable-Protokoll:
+ * PUT mit Content-Range "bytes *­/total" und leerem Body).
+ *
+ * Rueckgabe: {done:true, file} wenn schon komplett; {done:false, offset}
+ * zum Fortsetzen; null wenn die Session nicht mehr existiert (z.B. HTTP 404)
+ * - dann hilft nur ein kompletter Neustart ueber initUpload.
+ */
+function queryUploadStatus_(uploadUrl, total) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', uploadUrl, true);
+    xhr.setRequestHeader('Content-Range', `bytes */${total}`);
+
+    xhr.onload = () => {
+      if (xhr.status === 200 || xhr.status === 201) {
+        try {
+          resolve({ done: true, file: JSON.parse(xhr.responseText) });
+        } catch (e) {
+          resolve({ done: false, offset: 0 });
+        }
+        return;
+      }
+      if (xhr.status === 308) {
+        const range = xhr.getResponseHeader('Range'); // z.B. "bytes=0-4194303"
+        const match = range && range.match(/bytes=0-(\d+)/);
+        resolve({ done: false, offset: match ? parseInt(match[1], 10) + 1 : 0 });
+        return;
+      }
+      resolve(null);
+    };
+    xhr.onerror = () => resolve(null);
+    xhr.send();
+  });
+}
 /**
  * Alter Weg als Rueckfallebene: alles als Base64 im JSON-Body an Apps Script.
  * Bleibt drin, damit die App auch dann laeuft, wenn die Serverseite noch

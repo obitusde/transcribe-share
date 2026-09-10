@@ -123,16 +123,48 @@ Danach einmal neu autorisieren.
 ## Rückfallebene
 
 Der Client versucht immer zuerst den Direktweg. Schlägt `initUpload` fehl
-(z. B. weil Schritt 3 noch aussteht) oder scheitert der PUT an CORS, wechselt
-er automatisch auf den alten Base64-Weg und zeigt „Ersatzweg" an. Die App
-wird zu keinem Zeitpunkt unbenutzbar.
+oder scheitert der PUT endgültig (z. B. weil die Session abgelaufen ist),
+wechselt er automatisch auf den alten Base64-Weg und zeigt „Ersatzweg" an.
+Die App wird zu keinem Zeitpunkt unbenutzbar.
 
 Läuft der Direktweg, zeigt die Seite echten Fortschritt in Prozent und MB/s.
 
-## Nicht getestet
+## Chunked Upload mit Resume (seit App-Version v7)
 
-Der Direkt-Upload ist nicht real erprobt: die Umgebung, in der dieser Code
-entstand, hat keinen Netzzugang zu `script.google.com` oder `googleapis.com`,
-und der Ablauf startet ohnehin erst über das Android-Share-Target. Der
-wahrscheinlichste Stolperstein ist CORS beim PUT auf die Session-URL — genau
-dafür ist die Rückfallebene eingebaut.
+Der ursprüngliche Direktweg (v3–v6) hat die Resumable-Session zwar eröffnet,
+aber nie tatsächlich als "resumable" genutzt: `putBlobWithProgress` hat die
+komplette Datei in **einem** `xhr.send(blob)` geschickt, mit einem einzigen
+Timeout fürs Ganze und ohne jeden Retry. Bei kurzen Testdateien (Sekunden
+Übertragungszeit) fiel das nicht auf. Bei einer 56-minütigen Aufnahme dauert
+die Übertragung auf dem Handy deutlich länger, und in diesem Fenster reicht
+ein einziger kurzer Netzwackler (WLAN↔LTE-Wechsel, Screen-Lock, App kurz im
+Hintergrund), um den kompletten Upload mit "Fehler beim Hochladen" abzubrechen
+— unabhängig von der Dateigröße an sich, sondern von der *Dauer* der
+Übertragung.
+
+Seit v7 läuft der Upload in 4-MiB-Chunks (`putChunk_`):
+
+- Scheitert ein Chunk (Netzwerkfehler, Timeout, 5xx), wird er bis zu 5x mit
+  exponentiellem Backoff wiederholt, **bevor** aufgegeben wird.
+- Scheitert das endgültig, fragt `queryUploadStatus_()` beim Server nach
+  (offizielles Drive-Resumable-Protokoll: `PUT` mit
+  `Content-Range: bytes */<total>` und leerem Body), wie viele Bytes
+  tatsächlich schon angekommen sind, und der Upload setzt dort fort —
+  statt die komplette, womöglich sehr große Datei noch einmal zu senden
+  oder den Upload als gescheitert zu melden.
+- Nur wenn auch das scheitert (Server antwortet z. B. mit 404 — Session
+  wirklich verloren) gibt es endgültig auf, und der Client fällt auf den
+  Base64-Ersatzweg zurück.
+
+## Getestet
+
+Der Direktweg lief in der Praxis bereits erfolgreich (bestätigt über den
+`?action=version`-Endpoint und die Fusszeile "Direktweg aktiv" in der PWA).
+Der CORS-Fix (Origin an `initUpload_` durchreichen, siehe
+`ALLOWED_UPLOAD_ORIGINS` in `DirectUpload.gs`) war dafür notwendig und ist
+bereits deployt. Die Chunked-Upload-Erweiterung selbst ist neu und noch
+nicht mit einer sehr langen Aufnahme gegengetestet — falls "Fehler beim
+Hochladen" trotzdem wieder auftritt, bitte den genauen Text unter der
+Überschrift (die kleine graue Detailzeile) mitschicken, der jetzt den
+tatsächlichen HTTP-Status bzw. die Fehlerursache enthält statt nur
+"Netzwerk- oder CORS-Fehler".
