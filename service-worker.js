@@ -1,5 +1,5 @@
 // service-worker.js
-// Version: 9 (2026-09-10)
+// Version: 10 (2026-09-10)
 // Faengt den Web-Share-Target-POST ab, reicht die geteilte Datei an die Seite
 // weiter und leitet SOFORT dorthin um (statt den kompletten Upload
 // abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
@@ -9,21 +9,22 @@
 // IMMER sofort ankommen (network-first allein reichte nicht, weil fetch()
 // sonst still aus dem normalen HTTP-Cache bedient werden kann).
 //
-// v8: Die Datei geht NICHT mehr durch die Cache API. Grund: cache.put() mit
-// einer langen Aufnahme (56 Minuten) lief in einen QuotaExceededError, und
-// Chrome liefert bei dieser DOMException eine LEERE .message - der alte
-// Code hat nur error.message weitergereicht, die Seite zeigte deshalb ein
-// nacktes "Fehler beim Hochladen" ohne jeden Hinweis, und der Upload-Code
-// wurde nie erreicht.
+// v8: Die Datei geht nicht mehr durch die Cache API, sondern per postMessage
+// direkt an die Seite (kein Kopieren, keine Quota - das File-Objekt ist nur
+// ein Handle auf die Datei, die Android ohnehin auf der Platte hat).
+// Absicherung nach IndexedDB, falls der Worker zwischendurch beendet wird.
 //
-// Stattdessen: die File-Referenz wandert direkt per postMessage an die Seite
-// (kein Kopieren, keine Quota - das File-Objekt ist nur ein Handle auf die
-// Datei, die Android ohnehin schon auf der Platte hat). Als Absicherung fuer
-// den Fall, dass der Service Worker zwischen Redirect und Seitenaufbau
-// beendet wird, wird zusaetzlich im Hintergrund nach IndexedDB geschrieben -
-// scheitert das, ist es egal, solange der Speicherweg traegt.
+// v10: request.formData() lieferte bei einer 21-MB-Aufnahme eine LEERE
+// FormData, ohne zu werfen - die Datei war damit spurlos weg, noch bevor
+// irgendein Upload-Code lief. Deshalb jetzt zweigleisig:
+//   1. Vor dem Parsen eine Kopie des Requests anlegen.
+//   2. Liefert formData() keine Datei, den Multipart-Body selbst parsen.
+//   3. Scheitert auch das, im Fehlertext berichten, wie viele Bytes
+//      tatsaechlich ankamen - das trennt "Android hat nichts geschickt" von
+//      "Chrome konnte es nicht parsen", was von aussen sonst identisch
+//      aussieht.
 
-const CACHE_VERSION = 'transcribe-share-v9';
+const CACHE_VERSION = 'transcribe-share-v10';
 const SHARE_CACHE_KEY = './__shared-file__'; // nur noch fuer Altlasten
 const IDB_NAME = 'transcribe-share';
 const IDB_STORE = 'shares';
@@ -93,11 +94,35 @@ self.addEventListener('fetch', (event) => {
 
 async function handleShareTarget(event) {
   try {
-    const formData = await event.request.formData();
-    const file = pickSharedFile(formData);
+    const request = event.request;
+    const contentType = request.headers.get('content-type') || '(kein Content-Type)';
+    const contentLength = request.headers.get('content-length') || '(keine Angabe)';
 
+    // Kopie anlegen, BEVOR formData() den Body verbraucht - der Body laesst
+    // sich nur einmal lesen.
+    const rawCopy = request.clone();
+
+    let formData = null;
+    let formDataError = null;
+    try {
+      formData = await request.formData();
+    } catch (error) {
+      formDataError = describeError(error);
+    }
+
+    let file = formData ? pickSharedFile(formData) : null;
+
+    // Chrome liefert bei manchen Multipart-Bodies eine leere FormData, ohne
+    // zu werfen. Dann selbst parsen statt aufzugeben.
     if (!file) {
-      return redirectWithError(describeEmptyShare(formData));
+      const rawBytes = await readBytes(rawCopy);
+      file = parseMultipartFromBytes(rawBytes, contentType);
+
+      if (!file) {
+        return redirectWithError(
+          buildFailureReport(formData, formDataError, contentType, contentLength, rawBytes)
+        );
+      }
     }
 
     const token = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
@@ -121,10 +146,10 @@ function redirectWithError(message) {
 /**
  * Nimmt die erste echte Datei aus dem Formular, egal unter welchem Feldnamen.
  *
- * Verlaesst sich bewusst nicht mehr allein auf "audio": liefert Android die
- * Datei unter einem anderen Namen, landete sie vorher stillschweigend im
- * Nichts. Dateien mit 0 Bytes werden ebenfalls abgelehnt - die wuerden sonst
- * als leere Aufnahme in Drive landen und eine sinnlose Transkription starten.
+ * Verlaesst sich bewusst nicht allein auf "audio": liefert Android die Datei
+ * unter einem anderen Namen, landete sie vorher stillschweigend im Nichts.
+ * Dateien mit 0 Bytes werden abgelehnt - die wuerden sonst als leere
+ * Aufnahme in Drive landen und eine sinnlose Transkription starten.
  */
 function pickSharedFile(formData) {
   const named = formData.get('audio');
@@ -137,14 +162,110 @@ function pickSharedFile(formData) {
   return null;
 }
 
+async function readBytes(request) {
+  try {
+    const buffer = await request.arrayBuffer();
+    return new Uint8Array(buffer);
+  } catch (error) {
+    return null;
+  }
+}
+
 /**
- * Sagt, WAS statt der Datei ankam.
+ * Eigener Multipart-Parser als Rueckfallebene fuer den Fall, dass Chromes
+ * request.formData() den Body nicht hergibt.
  *
- * Ohne das steht nur "Keine Datei empfangen." da, und es bleibt offen, ob
- * Android gar nichts geschickt hat, eine leere Datei, oder nur Text (etwa
- * weil versehentlich das Transkript statt der Aufnahme geteilt wurde).
+ * Arbeitet absichtlich auf Bytes statt auf Text: der Dateiinhalt ist binaer
+ * und wuerde beim Umweg ueber einen String zerstoert.
  */
-function describeEmptyShare(formData) {
+function parseMultipartFromBytes(bytes, contentType) {
+  if (!bytes || bytes.length === 0) return null;
+
+  const boundaryMatch = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
+  if (!boundaryMatch) return null;
+
+  const boundary = (boundaryMatch[1] || boundaryMatch[2]).trim();
+  const encoder = new TextEncoder();
+  const delimiter = encoder.encode('--' + boundary);
+  const headerSeparator = encoder.encode('\r\n\r\n');
+
+  let searchFrom = 0;
+
+  while (true) {
+    const start = indexOfBytes(bytes, delimiter, searchFrom);
+    if (start === -1) return null;
+
+    let cursor = start + delimiter.length;
+
+    // "--" direkt nach dem Delimiter markiert das Ende des Bodies.
+    if (bytes[cursor] === 0x2d && bytes[cursor + 1] === 0x2d) return null;
+    if (bytes[cursor] === 0x0d && bytes[cursor + 1] === 0x0a) cursor += 2;
+
+    const headerEnd = indexOfBytes(bytes, headerSeparator, cursor);
+    if (headerEnd === -1) return null;
+
+    const headerText = new TextDecoder('utf-8').decode(bytes.subarray(cursor, headerEnd));
+    const contentStart = headerEnd + headerSeparator.length;
+
+    const nextDelimiter = indexOfBytes(bytes, delimiter, contentStart);
+    let contentEnd = nextDelimiter === -1 ? bytes.length : nextDelimiter;
+
+    // Das CRLF vor dem naechsten Delimiter gehoert zur Trennung, nicht zum Inhalt.
+    if (contentEnd >= 2 && bytes[contentEnd - 2] === 0x0d && bytes[contentEnd - 1] === 0x0a) {
+      contentEnd -= 2;
+    }
+
+    const filenameMatch = /filename\*?=(?:"([^"]*)"|([^;\r\n]+))/i.exec(headerText);
+    if (filenameMatch && contentEnd > contentStart) {
+      const filename = (filenameMatch[1] || filenameMatch[2] || 'share-upload.m4a').trim();
+      const typeMatch = /content-type:\s*([^\r\n;]+)/i.exec(headerText);
+      const type = typeMatch ? typeMatch[1].trim() : 'audio/mp4';
+      return new File([bytes.subarray(contentStart, contentEnd)], filename, { type: type });
+    }
+
+    searchFrom = contentEnd;
+  }
+}
+
+function indexOfBytes(haystack, needle, from) {
+  const limit = haystack.length - needle.length;
+
+  outer:
+  for (let i = from; i <= limit; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+
+  return -1;
+}
+
+/**
+ * Berichtet, WAS statt der Datei ankam.
+ *
+ * Der entscheidende Wert ist die Zahl der tatsaechlich gelesenen Bytes: sie
+ * trennt "Android hat gar nichts geschickt" (0 Bytes -> Problem liegt beim
+ * Teilen bzw. am WebAPK) von "die Bytes waren da, liessen sich aber nicht
+ * zuordnen" (viele Bytes -> Problem liegt beim Parsen). Von aussen sehen
+ * beide Faelle identisch aus.
+ */
+function buildFailureReport(formData, formDataError, contentType, contentLength, rawBytes) {
+  const parts = [];
+
+  parts.push('gelesen: ' + (rawBytes ? rawBytes.length + ' Bytes' : 'Body nicht lesbar'));
+  parts.push('Content-Length: ' + contentLength);
+  parts.push('Content-Type: ' + contentType);
+
+  if (formDataError) parts.push('formData() warf ' + formDataError);
+
+  const entries = formData ? describeEntries(formData) : [];
+  parts.push(entries.length ? 'Felder: ' + entries.join(', ') : 'keine Formularfelder');
+
+  return 'Keine verwertbare Datei empfangen. ' + parts.join(' | ');
+}
+
+function describeEntries(formData) {
   const parts = [];
 
   for (const entry of formData.entries()) {
@@ -157,14 +278,7 @@ function describeEmptyShare(formData) {
     }
   }
 
-  if (parts.length === 0) {
-    return 'Keine Datei empfangen - das Formular kam komplett leer an. ' +
-      'Meist heisst das, dass Android die Datei wegen des accept-Filters ' +
-      'verworfen hat; dann hilft nur, die App vom Homescreen zu entfernen ' +
-      'und neu hinzuzufuegen.';
-  }
-
-  return 'Keine verwertbare Datei empfangen. Angekommen ist: ' + parts.join(', ');
+  return parts;
 }
 
 /**
