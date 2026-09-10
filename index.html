@@ -20,6 +20,12 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   .hint { color: #777; font-size: 0.9rem; margin-top: 2.5rem; }
+  .pick {
+    display: inline-block; margin-top: 1.5rem; padding: 0.9rem 1.4rem;
+    background: #2c3e50; color: #fff; border-radius: 8px; font-size: 1rem;
+    cursor: pointer; border: none;
+  }
+  .pick:active { background: #1a252f; }
   .version { color: #999; font-size: 0.75rem; margin-top: 2rem; line-height: 1.6; }
   .version .bad { color: #b71c1c; font-weight: bold; }
   .version .good { color: #1e7e34; }
@@ -29,12 +35,18 @@
   <h1>🎙️ Transkription Upload</h1>
   <p>Diese Seite empfängt geteilte Sprachmemos aus dem Google Recorder und schickt sie automatisch zur Transkription.</p>
   <div id="result"></div>
-  <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü.</p>
+
+  <div id="picker" hidden>
+    <input type="file" id="fileInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.aac,.opus,.mp4" hidden>
+    <button class="pick" id="pickButton" type="button">📁 Aufnahme auswählen</button>
+  </div>
+
+  <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü. Klappt das Teilen nicht, lässt sich die Datei oben auch direkt auswählen.</p>
   <div class="version" id="version"></div>
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v10';
+const CACHE_VERSION = 'transcribe-share-v11';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -78,7 +90,9 @@ if (sharePending) {
 } else if (status) {
   history.replaceState({}, '', location.pathname);
   showResult(status, message);
+  showPicker();
 } else {
+  showPicker();
   // Kein frischer Share-Aufruf, aber evtl. laeuft noch eine Transkription von
   // vorhin - nach einem Reload nicht einfach den leeren Default-Screen
   // zeigen, sondern das Polling fortsetzen (oder zumindest einen Hinweis
@@ -121,18 +135,30 @@ function resumePendingIfAny() {
 }
 
 async function handleSharedFile(token) {
+  const shared = await getSharedFile(token).catch(() => null);
+
+  if (!shared) {
+    showResult('error', '', '❌ Die geteilte Datei war nicht mehr auffindbar. Bitte die Aufnahme noch einmal teilen — oder unten direkt auswählen.');
+    showPicker();
+    return;
+  }
+
+  return startUpload(shared.blob, shared.name || 'share-upload.m4a', shared.type || 'audio/mp4');
+}
+
+/**
+ * Die eigentliche Upload-Strecke, unabhaengig davon, WOHER die Datei kommt.
+ *
+ * Zweiter Aufrufer ist die manuelle Dateiauswahl: der Android-Share-Target
+ * liefert die Datei bei laengeren Aufnahmen gar nicht erst an die PWA aus
+ * (der POST kommt mit einem leeren Multipart-Body an), und dagegen laesst
+ * sich von hier aus nichts machen. Ueber <input type="file"> kommt dieselbe
+ * Datei ohne diesen Umweg herein.
+ */
+async function startUpload(blob, filename, mimeType) {
+  hidePicker();
+
   try {
-    const shared = await getSharedFile(token);
-
-    if (!shared) {
-      showResult('error', '', '❌ Die geteilte Datei war nicht mehr auffindbar. Bitte die Aufnahme noch einmal teilen.');
-      return;
-    }
-
-    const filename = shared.name || 'share-upload.m4a';
-    const mimeType = shared.type || 'audio/mp4';
-    const blob = shared.blob;
-
     localStorage.setItem(IN_PROGRESS_KEY, JSON.stringify({ startedAt: Date.now() }));
 
     const sizeMb = Math.round(blob.size / 1024 / 1024 * 10) / 10;
@@ -158,8 +184,29 @@ async function handleSharedFile(token) {
   } catch (error) {
     localStorage.removeItem(IN_PROGRESS_KEY);
     showResult('error', describeError(error));
+    showPicker();
   }
 }
+
+function showPicker() {
+  document.getElementById('picker').hidden = false;
+}
+
+function hidePicker() {
+  document.getElementById('picker').hidden = true;
+}
+
+document.getElementById('pickButton').addEventListener('click', () => {
+  document.getElementById('fileInput').click();
+});
+
+document.getElementById('fileInput').addEventListener('change', (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  event.target.value = ''; // damit dieselbe Datei erneut gewaehlt werden kann
+  showLoading(`Datei übernommen: ${file.name}`);
+  startUpload(file, file.name, file.type || 'audio/mp4');
+});
 
 /**
  * Fehlertext, der NIE leer ist.
