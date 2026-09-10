@@ -63,6 +63,7 @@ function handleUploadAction_(e) {
   try {
     if (data.action === 'initUpload') return jsonResponse_(initUpload_(data));
     if (data.action === 'completeUpload') return jsonResponse_(completeUpload_(data));
+    if (data.action === 'startPending') return jsonResponse_(startPending_());
   } catch (err) {
     return jsonResponse_({ status: 'error', message: String((err && err.message) || err) });
   }
@@ -172,6 +173,44 @@ function completeUpload_(data) {
     fileName: (transcriptionResult && transcriptionResult.fileName) || file.getName(),
     fileSize: file.getSize(),
     transcription: transcriptionResult
+  };
+}
+
+/**
+ * Startet die Transkription fuer alles, was schon im Arbeitsordner liegt.
+ *
+ * Gedacht fuer Aufnahmen, die per Drive-App dort gelandet sind statt ueber
+ * den Share-Target der PWA - dieser Weg liefert die Datei zeitweise nicht
+ * aus (der POST kommt mit leerem Multipart-Body an).
+ *
+ * Ruft bewusst scheduleAutoCheck() auf. Die Weboberflaeche
+ * (startTranscriptionWorkflow) tut das NICHT, weshalb dort ohne offene
+ * Seite nie finalisiert und damit auch keine Mail versendet wird. Ueber
+ * diesen Weg kommt die Mail automatisch.
+ *
+ * Antwortform wie bei completeUpload_, damit die PWA unveraendert weiter
+ * ihren Status-Endpoint pollen kann.
+ */
+function startPending_() {
+  var results = startAllPendingTranscriptions_();
+
+  if (!results.length) {
+    return {
+      status: 'empty',
+      message: 'Keine wartende Aufnahme im Ordner "' + CONFIG.FOLDER_WORK_NAME + '".'
+    };
+  }
+
+  var processing = results.filter(function (r) { return r.status === 'processing'; });
+  if (processing.length) scheduleAutoCheck();
+
+  var reported = processing[0] || results[0];
+
+  return {
+    status: 'ok',
+    started: processing.length,
+    total: results.length,
+    transcription: reported
   };
 }
 

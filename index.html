@@ -42,7 +42,7 @@
   <div id="picker" hidden>
     <input type="file" id="fileInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.aac,.opus,.mp4" hidden>
     <button class="pick" id="pickButton" type="button">📁 Aufnahme auswählen</button>
-    <a class="pick secondary" id="driveLink" href="#">▶️ In Drive abgelegte Aufnahme transkribieren</a>
+    <button class="pick secondary" id="startPendingButton" type="button">▶️ Transkription starten</button>
   </div>
 
   <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü. Klappt das Teilen nicht, lässt sich die Datei oben auch direkt auswählen.</p>
@@ -50,7 +50,7 @@
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v13';
+const CACHE_VERSION = 'transcribe-share-v14';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -200,10 +200,52 @@ function hidePicker() {
   document.getElementById('picker').hidden = true;
 }
 
-// Ohne Parameter liefert doGet() die Apps-Script-Oberflaeche mit dem
-// "Transkription starten"-Button aus. Das ist der Weg, wenn die Aufnahme
-// per Drive-App im Arbeitsordner gelandet ist, statt ueber den Share-Target.
-document.getElementById('driveLink').href = SCRIPT_URL;
+/**
+ * Startet die Transkription fuer die Aufnahmen, die schon in Drive liegen.
+ *
+ * Der Weg fuer Dateien, die per Drive-App im Arbeitsordner gelandet sind:
+ * der Share-Target der PWA liefert die Aufnahme zeitweise nicht aus, und
+ * Recorder-Aufnahmen tauchen im Datei-Auswahldialog nicht auf, weil sie im
+ * app-privaten Speicher liegen.
+ */
+document.getElementById('startPendingButton').addEventListener('click', async () => {
+  hidePicker();
+  showLoading('Suche Aufnahmen in Drive …');
+
+  try {
+    const response = await postJsonToScript({ action: 'startPending' }, COMPLETE_TIMEOUT_MS);
+
+    if (response && response.status === 'empty') {
+      showResult('error', '', 'ℹ️ ' + response.message);
+      showPicker();
+      return;
+    }
+
+    const transcription = response && response.transcription;
+    if (!response || response.status !== 'ok' || !transcription || !transcription.fileName) {
+      throw new Error(
+        (response && response.message) ||
+        (transcription && transcription.message) ||
+        'Transkription konnte nicht gestartet werden.'
+      );
+    }
+
+    if (transcription.status !== 'processing') {
+      throw new Error(transcription.message || 'Transkription konnte nicht gestartet werden.');
+    }
+
+    const startedAt = Date.now();
+    localStorage.setItem(PENDING_KEY, JSON.stringify({ fileName: transcription.fileName, startedAt }));
+    showLoading(response.started > 1
+      ? `${response.started} Aufnahmen gestartet. Transkription läuft …`
+      : 'Transkription läuft …');
+    pollStatus(transcription.fileName, startedAt);
+
+  } catch (error) {
+    showResult('error', describeError(error));
+    showPicker();
+  }
+});
 
 document.getElementById('pickButton').addEventListener('click', () => {
   document.getElementById('fileInput').click();
