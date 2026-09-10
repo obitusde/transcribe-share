@@ -1,5 +1,5 @@
 // service-worker.js
-// Version: 12 (2026-09-10)
+// Version: 13 (2026-09-10)
 // Faengt den Web-Share-Target-POST ab, reicht die geteilte Datei an die Seite
 // weiter und leitet SOFORT dorthin um (statt den kompletten Upload
 // abzuwarten, bevor irgendwas angezeigt wird - das fuehrte zu einem
@@ -24,7 +24,7 @@
 //      "Chrome konnte es nicht parsen", was von aussen sonst identisch
 //      aussieht.
 
-const CACHE_VERSION = 'transcribe-share-v12';
+const CACHE_VERSION = 'transcribe-share-v13';
 const SHARE_CACHE_KEY = './__shared-file__'; // nur noch fuer Altlasten
 const IDB_NAME = 'transcribe-share';
 const IDB_STORE = 'shares';

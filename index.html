@@ -26,6 +26,9 @@
     cursor: pointer; border: none;
   }
   .pick:active { background: #1a252f; }
+  .pick.secondary { background: #eef1f4; color: #2c3e50; text-decoration: none; }
+  .pick.secondary:active { background: #dde3e8; }
+  #picker .pick { display: block; margin-left: auto; margin-right: auto; max-width: 20rem; }
   .version { color: #999; font-size: 0.75rem; margin-top: 2rem; line-height: 1.6; }
   .version .bad { color: #b71c1c; font-weight: bold; }
   .version .good { color: #1e7e34; }
@@ -39,6 +42,7 @@
   <div id="picker" hidden>
     <input type="file" id="fileInput" accept="audio/*,.m4a,.mp3,.wav,.ogg,.aac,.opus,.mp4" hidden>
     <button class="pick" id="pickButton" type="button">📁 Aufnahme auswählen</button>
+    <a class="pick secondary" id="driveLink" href="#">▶️ In Drive abgelegte Aufnahme transkribieren</a>
   </div>
 
   <p class="hint">Zum Nutzen: diese Seite zum Homescreen hinzufügen. Danach erscheint sie nach dem Stoppen einer Aufnahme im Recorder-"Teilen"-Menü. Klappt das Teilen nicht, lässt sich die Datei oben auch direkt auswählen.</p>
@@ -46,7 +50,7 @@
 
 <script>
 const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec';
-const CACHE_VERSION = 'transcribe-share-v12';
+const CACHE_VERSION = 'transcribe-share-v13';
 const SHARE_CACHE_KEY = './__shared-file__';
 const STATUS_POLL_INTERVAL_MS = 4000;
 const STATUS_POLL_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten, danach Hinweis statt Endlos-Polling
@@ -195,6 +199,11 @@ function showPicker() {
 function hidePicker() {
   document.getElementById('picker').hidden = true;
 }
+
+// Ohne Parameter liefert doGet() die Apps-Script-Oberflaeche mit dem
+// "Transkription starten"-Button aus. Das ist der Weg, wenn die Aufnahme
+// per Drive-App im Arbeitsordner gelandet ist, statt ueber den Share-Target.
+document.getElementById('driveLink').href = SCRIPT_URL;
 
 document.getElementById('pickButton').addEventListener('click', () => {
   document.getElementById('fileInput').click();
