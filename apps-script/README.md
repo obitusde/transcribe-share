@@ -179,7 +179,49 @@ leeren Text: fehlt die `.message`, wird der `.name` der Exception angezeigt.
 Genau diese Zeile hat vorher gefehlt, um das Problem überhaupt sehen zu
 können.
 
-## Stand zum Share-Target-Problem (10.09.2026)
+## Share-Target: abgeschlossen, nicht behebbar (24.09.2026)
+
+Der Web-Share-Target liefert die Datei nicht mehr aus. Ausgeschlossen wurde,
+jeweils gemessen statt vermutet:
+
+| Verdacht | Widerlegt durch |
+|---|---|
+| Dateigröße / Dauer | 23,3 MB ging am 08.09.; 10 Sekunden scheitern |
+| Cache-Quota | Der Code wird nie erreicht |
+| Defektes `formData()` | Meldet korrekt null Felder; Byte-Parser findet auch nichts |
+| `accept`-Filter | Erweiterte Liste seit WebAPK v2 (23.09.) aktiv, unverändert |
+| Fehlende Text-Parameter | `title`/`text`/`url` deklariert, trotzdem null Felder |
+| Google Recorder | Lokal gespeicherte Datei aus der Dateien-App scheitert genauso |
+| Stale WebAPK | Echte Deinstallation über Einstellungen → Apps, neu installiert: unverändert |
+| Alles aus diesem Repo | Manifest unverändert 14.08.–10.09.; SW läuft erst nach dem POST |
+
+Das Zeitfenster ließ sich über die Archiv-Zeitstempel auf rund 40 Stunden
+eingrenzen: letzter erfolgreicher Share am **08.09. um 16:25**, am **10.09.**
+morgens ging es nicht mehr. In diesem Fenster wurde weder am Repo noch am
+Gerät etwas von Hand geändert.
+
+Chrome nimmt den Intent entgegen und baut den POST **ohne** die Datei
+zusammen — sofort, ohne die Bytes zu lesen. Das geschieht zwischen WebAPK und
+Chrome, also in Google-Code. Von der PWA aus ist daran nichts zu reparieren;
+jede Änderung an `manifest.json`, `service-worker.js` oder `index.html` läuft
+an der Stelle vorbei, an der es scheitert.
+
+**Konsequenz:** Der Weg über die Drive-App ist der Hauptweg geworden, siehe
+`FolderWatcher.gs`. Der Auswahl-Knopf und der Start-Knopf in der PWA bleiben
+als manuelle Optionen bestehen.
+
+### Ein Detail, das drei Runden gekostet hat
+
+Das Entfernen des Icons vom Homescreen **deinstalliert die PWA nicht**.
+Chrome behält das WebAPK und legt beim erneuten Hinzufügen nur das Icon neu
+an — die Share-Target-Registrierung bleibt die alte. Eine
+Manifest-Änderung erreicht das Gerät erst, wenn Chrome das WebAPK von sich
+aus neu erzeugt (hier: 13 Tage später). Wer wirklich neu installieren will,
+geht über **Einstellungen → Apps → App → Deinstallieren**; `chrome://webapks`
+zeigt mit „Version code" und „Last Update Completion Time", was tatsächlich
+auf dem Gerät liegt.
+
+## Frühere Notiz zum Share-Target-Problem (10.09.2026)
 
 Gesichert, jeweils nachgemessen statt vermutet:
 
