@@ -1,69 +1,78 @@
 /**
- * DirectUpload.gs — direkter Drive-Upload statt Base64 durch Apps Script.
+ * DirectUpload.gs - Schnittstelle fuer die Android-App "Aufnahme".
+ * Version 2 (2026-11-01)
  *
- * WARUM
- * -----
- * Der alte doPost() macht zwei teure Dinge synchron, bevor er antwortet:
+ * Ersetzt die Version 1 dieser Datei komplett. Neu gegenueber Version 1:
  *
- *   1. Utilities.base64Decode() ueber ~22,6 MB Text (die 17-MB-Aufnahme,
- *      um 33% aufgeblaeht) + folder.createFile() mit dem 17-MB-Blob.
- *   2. startAllPendingTranscriptions_() fuer ALLE wartenden Dateien - pro
- *      Datei mehrere Drive-Roundtrips (Ordner scannen, umbenennen,
- *      ensureUniqueFileName_, getJobState, saveJobState mit Rueck-Lesen und
- *      Retry-Sleeps) plus ein AssemblyAI-API-Call.
+ *   - Geheimer Schluessel (Skripteigenschaft UPLOAD_SECRET). Ist er gesetzt,
+ *     wird JEDE POST-Anfrage ohne passenden Schluessel abgelehnt - auch der
+ *     alte Base64-Weg in doPost(), der sonst ungeschuetzt weiterliefe.
+ *   - Kontext pro Aufnahme (z. B. "1:1 mit Emmy"). Er geht als Zusatz in den
+ *     AssemblyAI-Prompt und steht oben im Transkript.
+ *   - Mail-Auswahl pro Aufnahme: Arbeit, Privat oder keine Mail.
+ *     Die Adressen stehen NUR in den Skripteigenschaften (MAIL_WORK,
+ *     MAIL_PRIVATE), nie im Code. Fehlt MAIL_WORK, gilt wie bisher
+ *     CONFIG.TARGET_EMAIL aus Code.gs.
+ *   - Jedes fertige Transkript wird zusaetzlich als .txt im Drive-Ordner
+ *     "Transkripte" abgelegt (neben "Archive"). Von dort holt die App es ab.
  *
- * Schritt 1 faellt hier komplett weg: der Browser schiebt die Bytes als
- * rohes Binary direkt zu Drive. Apps Script sieht nur noch winzige
- * JSON-Nachrichten.
+ * Kontext und Mail-Auswahl reisen in der Drive-Beschreibung der Audiodatei
+ * mit (letzte Zeile "#app mail=..."). So gehen sie nicht verloren, egal ob
+ * completeUpload oder FolderWatcher die Transkription startet. Dateien ohne
+ * diese Zeile (z. B. aus dem Google Recorder per Drive geteilt) laufen genau
+ * wie bisher.
  *
- * Schritt 2 bleibt bewusst synchron in completeUpload_() - identisch zum
- * alten Verhalten, damit die Antwort weiterhin den normalisierten Dateinamen
- * enthaelt, auf den die PWA ihr Status-Polling stuetzt. Der Teil kostet
- * Sekunden, nicht Minuten.
- *
- * Der OAuth-Token des Skripts wird NIE an den Browser gegeben. Die
- * Session-URL ist ein kurzlebiges Capability-Token fuer genau diese Datei.
- *
- * EINBAU: siehe apps-script/README.md
+ * EINBAU: siehe apps-script/ANLEITUNG-APP-V2.md
+ * Code.gs braucht zwei Ein-Zeilen-Aenderungen, die applyAppOptions_() und
+ * deliverTranscript_() aus dieser Datei aufrufen.
  */
 
 var DRIVE_RESUMABLE_INIT_URL =
   'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true';
 
-/**
- * Origins, deren Browser eine Session-URL weiterbenutzen duerfen.
- *
- * Der Google-Upload-Server merkt sich den Origin aus dem INIT-Call und
- * schickt nur dann Access-Control-Allow-Origin auf die Antwort des PUT.
- * Ohne diesen Eintrag kommen die Bytes zwar an, aber der Browser darf die
- * Antwort nicht lesen - der Upload sieht wie ein Netzwerkfehler aus.
- */
+/** Origins, deren Browser (alte PWA) eine Session-URL weiterbenutzen duerfen. */
 var ALLOWED_UPLOAD_ORIGINS = ['https://obitusde.github.io'];
 
+/** Die App fragt per "hello" danach und schaltet neue Funktionen erst ab 2 frei. */
+var APP_API_VERSION = 2;
+
+var APP_MAIL_CHOICES = ['work', 'private', 'none'];
+var APP_CONTEXT_MAX = 500;
+var APP_MARKER_RE = /(?:^|\n)#app mail=(work|private|none)\s*$/;
+var TRANSCRIPT_FOLDER_NAME = 'Transkripte';
+
 /**
- * Router fuer die neuen Upload-Actions.
+ * Router, aufgerufen ganz oben in doPost().
  *
  * Gibt einen fertigen TextOutput zurueck, wenn die Anfrage zu diesem Modul
- * gehoert - sonst null, damit der bestehende Base64-Pfad in doPost()
- * unveraendert weiterlaeuft. Dadurch funktioniert eine alte, noch
- * ausgelieferte Client-Version weiter.
+ * gehoert oder abgelehnt wird - sonst null, damit doPost() weitermacht.
  */
 function handleUploadAction_(e) {
-  if (!e || !e.postData || !e.postData.contents) return null;
+  var raw = e && e.postData && e.postData.contents;
+  var data = null;
+  if (raw) {
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      data = null;
+    }
+  }
 
-  var data;
-  try {
-    data = JSON.parse(e.postData.contents);
-  } catch (err) {
-    return null; // Kein JSON -> nicht unsere Anfrage.
+  var secret = getUploadSecret_();
+  if (secret && !(data && typeof data.secret === 'string' && data.secret === secret)) {
+    return jsonResponse_({ status: 'error', code: 'auth', message: 'Schluessel fehlt oder ist falsch.' });
   }
 
   if (!data || !data.action) return null;
 
   try {
-    if (data.action === 'initUpload') return jsonResponse_(initUpload_(data));
-    if (data.action === 'completeUpload') return jsonResponse_(completeUpload_(data));
-    if (data.action === 'startPending') return jsonResponse_(startPending_());
+    switch (data.action) {
+      case 'hello': return jsonResponse_(hello_());
+      case 'initUpload': return jsonResponse_(initUpload_(data));
+      case 'completeUpload': return jsonResponse_(completeUpload_(data));
+      case 'startPending': return jsonResponse_(startPending_());
+      case 'transcript': return jsonResponse_(transcriptAction_(data));
+    }
   } catch (err) {
     return jsonResponse_({ status: 'error', message: String((err && err.message) || err) });
   }
@@ -71,13 +80,28 @@ function handleUploadAction_(e) {
   return null;
 }
 
+function getUploadSecret_() {
+  var value = PropertiesService.getScriptProperties().getProperty('UPLOAD_SECRET');
+  return value ? String(value).trim() : '';
+}
+
+/** Die App prueft damit, welche Funktionen das Script schon kann. */
+function hello_() {
+  var props = PropertiesService.getScriptProperties();
+  return {
+    status: 'ok',
+    api: APP_API_VERSION,
+    secretRequired: !!getUploadSecret_(),
+    mailPrivate: !!props.getProperty('MAIL_PRIVATE')
+  };
+}
+
 /**
  * Schritt 1: Resumable-Upload-Session bei Drive eroeffnen.
  *
- * Die Datei wird bewusst unter ihrem ORIGINALNAMEN im Arbeitsordner
- * angelegt. Das Umbenennen auf das kanonische Schema
- * (YYYY-MM-DD_HH-mm-ss.ext) macht weiterhin startTranscriptionForFile_() -
- * hier nichts vorwegnehmen, sonst laufen zwei Namenslogiken gegeneinander.
+ * Die Datei wird unter ihrem ORIGINALNAMEN angelegt; das Umbenennen macht
+ * weiterhin startTranscriptionForFile_(). Kontext und Mail-Auswahl kommen in
+ * die Drive-Beschreibung.
  */
 function initUpload_(data) {
   var fileName = data.filename || 'share-upload.m4a';
@@ -93,6 +117,8 @@ function initUpload_(data) {
     mimeType: mimeType,
     parents: [folders.next().getId()]
   };
+  var description = buildAppDescription_(data.context, data.mail);
+  if (description) metadata.description = description;
 
   var headers = {
     Authorization: 'Bearer ' + ScriptApp.getOAuthToken(),
@@ -100,9 +126,7 @@ function initUpload_(data) {
   };
   if (data.size) headers['X-Upload-Content-Length'] = String(data.size);
 
-  // Ohne Origin HIER liefert der Upload-Server beim spaeteren PUT kein
-  // Access-Control-Allow-Origin (nur der OPTIONS-Preflight antwortet
-  // korrekt - deshalb sieht der Fehler wie ein reines Netzwerkproblem aus).
+  // Nur fuer die alte Browser-PWA noetig (CORS beim spaeteren PUT).
   if (data.origin && ALLOWED_UPLOAD_ORIGINS.indexOf(data.origin) !== -1) {
     headers['Origin'] = data.origin;
   }
@@ -128,14 +152,7 @@ function initUpload_(data) {
   return { status: 'ok', uploadUrl: uploadUrl, fileName: fileName };
 }
 
-/**
- * Schritt 2: Der Browser meldet, dass die Bytes in Drive angekommen sind.
- *
- * Ab hier laeuft exakt das, was frueher im Rumpf von doPost() nach
- * createFile() stand - nur ohne die teure Dekodierung davor. Die
- * Antwortform ist absichtlich identisch zur alten, damit die PWA nichts
- * weiter anpassen muss.
- */
+/** Schritt 2: Die Bytes sind in Drive. Transkription sofort starten. */
 function completeUpload_(data) {
   var uploadedFileId = data.fileId;
   if (!uploadedFileId) {
@@ -176,21 +193,7 @@ function completeUpload_(data) {
   };
 }
 
-/**
- * Startet die Transkription fuer alles, was schon im Arbeitsordner liegt.
- *
- * Gedacht fuer Aufnahmen, die per Drive-App dort gelandet sind statt ueber
- * den Share-Target der PWA - dieser Weg liefert die Datei zeitweise nicht
- * aus (der POST kommt mit leerem Multipart-Body an).
- *
- * Ruft bewusst scheduleAutoCheck() auf. Die Weboberflaeche
- * (startTranscriptionWorkflow) tut das NICHT, weshalb dort ohne offene
- * Seite nie finalisiert und damit auch keine Mail versendet wird. Ueber
- * diesen Weg kommt die Mail automatisch.
- *
- * Antwortform wie bei completeUpload_, damit die PWA unveraendert weiter
- * ihren Status-Endpoint pollen kann.
- */
+/** Startet alles, was schon im Arbeitsordner liegt (Knopf der alten PWA). */
 function startPending_() {
   var results = startAllPendingTranscriptions_();
 
@@ -204,14 +207,145 @@ function startPending_() {
   var processing = results.filter(function (r) { return r.status === 'processing'; });
   if (processing.length) scheduleAutoCheck();
 
-  var reported = processing[0] || results[0];
-
   return {
     status: 'ok',
     started: processing.length,
     total: results.length,
-    transcription: reported
+    transcription: processing[0] || results[0]
   };
+}
+
+/** Liefert das fertige Transkript als Text (fuer den TXT-Download der App). */
+function transcriptAction_(data) {
+  if (!data.fileId) return { status: 'error', message: 'fileId fehlt im Request.' };
+
+  var file = DriveApp.getFileById(data.fileId);
+  var txt = findTranscriptFile_(file.getName());
+  if (!txt) return { status: 'missing' };
+
+  return { status: 'ok', name: txt.getName(), text: txt.getBlob().getDataAsString('UTF-8') };
+}
+
+// --- Kontext und Mail-Auswahl -------------------------------------------
+
+function buildAppDescription_(context, mail) {
+  var hasMail = APP_MAIL_CHOICES.indexOf(mail) !== -1;
+  var ctx = typeof context === 'string'
+    ? context.replace(/\s+/g, ' ').trim().slice(0, APP_CONTEXT_MAX)
+    : '';
+  if (!hasMail && !ctx) return '';
+  return (ctx ? ctx + '\n' : '') + '#app mail=' + (hasMail ? mail : 'work');
+}
+
+/**
+ * Liest Kontext und Mail-Auswahl aus der Drive-Beschreibung. Nur wenn die
+ * Markierungszeile da ist - eine selbst geschriebene Beschreibung einer
+ * anderen Datei wird nie als Kontext verwendet.
+ */
+function readAppOptions_(file) {
+  var description = '';
+  try {
+    description = file.getDescription() || '';
+  } catch (err) {
+    description = '';
+  }
+  var match = description.match(APP_MARKER_RE);
+  if (!match) return { context: '', mail: null };
+  return { context: description.slice(0, match.index).trim(), mail: match[1] };
+}
+
+/**
+ * Aufruf aus startTranscriptionForFile_() in Code.gs, direkt bevor der
+ * Auftrag an AssemblyAI geht. Haengt den Kontext an den Prompt an.
+ * Darf nie den Start verhindern.
+ */
+function applyAppOptions_(file, payload) {
+  try {
+    var opts = readAppOptions_(file);
+    if (opts.context) {
+      payload.prompt = (payload.prompt ? payload.prompt + ' ' : '') +
+        'Context for this specific recording, given by the person who recorded it: ' +
+        opts.context;
+    }
+  } catch (err) {
+    Logger.log('applyAppOptions_: ' + err.message);
+  }
+}
+
+/**
+ * Aufruf aus finalizeCompletedTranscript() in Code.gs anstelle des direkten
+ * sendEmailTranscriptOnly(CONFIG.TARGET_EMAIL, ...).
+ *
+ * Legt zuerst die .txt in Drive ab (darf scheitern, ohne die Mail zu
+ * verhindern) und schickt dann die Mail an die gewaehlte Adresse - oder gar
+ * keine. Wirft, wenn die Mail scheitert: dann versucht der Status-Trigger es
+ * spaeter erneut, genau wie bisher.
+ */
+function deliverTranscript_(file, fileName, transcriptText, summaryInfo, confidence) {
+  var opts = readAppOptions_(file);
+  var text = opts.context ? 'Kontext: ' + opts.context + '\n\n' + transcriptText : transcriptText;
+
+  try {
+    saveTranscriptFile_(fileName, text, summaryInfo);
+  } catch (err) {
+    Logger.log('Transkript-Datei konnte nicht gespeichert werden: ' + err.message);
+  }
+
+  var recipient = resolveRecipient_(opts.mail);
+  if (recipient) {
+    sendEmailTranscriptOnly(recipient, fileName, text, file.getLastUpdated(), summaryInfo, confidence);
+  } else {
+    Logger.log('Keine Mail fuer "' + fileName + '" (so in der App gewaehlt).');
+  }
+}
+
+function resolveRecipient_(mail) {
+  if (mail === 'none') return null;
+  var props = PropertiesService.getScriptProperties();
+  if (mail === 'private') {
+    var privateAddress = props.getProperty('MAIL_PRIVATE');
+    if (privateAddress) return privateAddress;
+    Logger.log('MAIL_PRIVATE fehlt in den Skripteigenschaften - sende an die Arbeitsadresse.');
+  }
+  return props.getProperty('MAIL_WORK') || CONFIG.TARGET_EMAIL;
+}
+
+// --- Transkripte als .txt in Drive ----------------------------------------
+
+function transcriptFileName_(fileName) {
+  return String(fileName).replace(/\.[^.]+$/, '') + '.txt';
+}
+
+function transcriptFolder_(create) {
+  var parent = DriveApp.getFolderById(CONFIG.FOLDER_TRANSCRIPT_ID);
+  var found = parent.getFoldersByName(TRANSCRIPT_FOLDER_NAME);
+  if (found.hasNext()) return found.next();
+  return create ? parent.createFolder(TRANSCRIPT_FOLDER_NAME) : null;
+}
+
+function saveTranscriptFile_(fileName, text, summaryInfo) {
+  var folder = transcriptFolder_(true);
+  var name = transcriptFileName_(fileName);
+  var parts = [];
+  if (summaryInfo && summaryInfo.text) {
+    parts.push('Zusammenfassung:', summaryInfo.text, '', '---', '');
+  }
+  parts.push(text);
+  var content = parts.join('\n');
+
+  var existing = folder.getFilesByName(name);
+  if (existing.hasNext()) {
+    existing.next().setContent(content);
+  } else {
+    folder.createFile(name, content, MimeType.PLAIN_TEXT);
+  }
+}
+
+function findTranscriptFile_(fileName) {
+  var folder = transcriptFolder_(false);
+  if (!folder) return null;
+  var files = folder.getFilesByName(transcriptFileName_(fileName));
+  return files.hasNext() ? files.next() : null;
 }
 
 /** Header-Namen kommen je nach Aufruf mal gross-, mal kleingeschrieben. */

@@ -16,7 +16,7 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = buildNumber
-        versionName = "1.0.$buildNumber"
+        versionName = "2.0.$buildNumber"
     }
 
     signingConfigs {
@@ -52,4 +52,5 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 }

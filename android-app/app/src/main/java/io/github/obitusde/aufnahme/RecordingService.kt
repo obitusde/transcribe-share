@@ -1,8 +1,6 @@
 package io.github.obitusde.aufnahme
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
@@ -26,8 +24,9 @@ import java.util.concurrent.Executors
  * werden, solange die App sichtbar ist - deshalb startet die Aufnahme immer
  * ueber den Knopf in der App.
  *
- * Nach dem Stopp laedt derselbe Dienst alle wartenden Aufnahmen hoch und
- * beendet sich dann.
+ * Nach dem Stopp laedt derselbe Dienst alle wartenden Aufnahmen hoch (nur
+ * die mit Transkription "an") und beendet sich dann. Den Fortschritt der
+ * Transkription verfolgt danach der StatusWorker.
  */
 class RecordingService : Service() {
 
@@ -36,10 +35,9 @@ class RecordingService : Service() {
         const val ACTION_STOP = "io.github.obitusde.aufnahme.STOP"
         const val ACTION_UPLOAD = "io.github.obitusde.aufnahme.UPLOAD"
 
-        private const val CHANNEL_RUNNING = "laufend"
-        private const val CHANNEL_RESULT = "ergebnis"
-        private const val NOTIFICATION_RUNNING = 1
-        private const val NOTIFICATION_RESULT = 2
+        const val EXTRA_MODE = "mode"
+        const val EXTRA_CONTEXT = "context"
+        const val EXTRA_MAIL = "mail"
 
         @Volatile
         var recordingFile: File? = null
@@ -71,20 +69,14 @@ class RecordingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_RUNNING, "Laufende Aufnahme", NotificationManager.IMPORTANCE_LOW)
-        )
-        nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_RESULT, "Upload-Ergebnis", NotificationManager.IMPORTANCE_DEFAULT)
-        )
+        Notifier.ensureChannels(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
                 goForeground()
-                startRecording()
+                startRecording(intent)
             }
             ACTION_STOP -> stopRecording()
             ACTION_UPLOAD -> {
@@ -99,7 +91,7 @@ class RecordingService : Service() {
     private fun goForeground() {
         ServiceCompat.startForeground(
             this,
-            NOTIFICATION_RUNNING,
+            Notifier.ID_RUNNING,
             buildRunningNotification(),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         )
@@ -109,7 +101,7 @@ class RecordingService : Service() {
     private fun newRecorder(): MediaRecorder =
         if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
 
-    private fun startRecording() {
+    private fun startRecording(intent: Intent) {
         if (isRecording()) {
             notifyRunning()
             return
@@ -134,10 +126,17 @@ class RecordingService : Service() {
             return
         }
 
+        val rec = Rec(file.name)
+        rec.mode = intent.getStringExtra(EXTRA_MODE) ?: Rec.MODE_TRANSCRIBE
+        rec.context = intent.getStringExtra(EXTRA_CONTEXT) ?: ""
+        rec.mail = intent.getStringExtra(EXTRA_MAIL) ?: Prefs.MAIL_WORK
+        rec.phase = Rec.PHASE_RECORDING
+        Store.save(this, rec)
+
         recorder = r
         startedAt = SystemClock.elapsedRealtime()
         recordingFile = file
-        status = "Aufnahme laeuft. Der Bildschirm darf aus."
+        status = "Aufnahme läuft. Der Bildschirm darf aus."
 
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Aufnahme:recording").apply {
@@ -151,20 +150,33 @@ class RecordingService : Service() {
         val r = recorder
         val file = recordingFile
         recorder = null
+        var kept = false
         if (r != null) {
             try {
                 r.stop()
-                status = "Gespeichert: ${file?.name}"
+                kept = true
             } catch (e: RuntimeException) {
                 // stop() wirft, wenn praktisch nichts aufgenommen wurde.
-                file?.delete()
-                status = "Aufnahme war zu kurz und wurde verworfen."
             }
             r.release()
         }
         recordingFile = null
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+
+        if (file != null) {
+            if (kept && file.length() > 0L) {
+                // Optionen frisch lesen: die App kann sie waehrend der Aufnahme geaendert haben.
+                val rec = Store.get(this, file.name)
+                val local = rec.mode == Rec.MODE_LOCAL
+                rec.phase = if (local) Rec.PHASE_LOCAL else Rec.PHASE_NEW
+                Store.save(this, rec)
+                status = if (local) "Gespeichert, nur auf dem Handy: ${file.name}" else "Gespeichert: ${file.name}"
+            } else {
+                Store.deleteRecording(this, file.name)
+                status = "Aufnahme war zu kurz und wurde verworfen."
+            }
+        }
         uploadPending()
     }
 
@@ -173,7 +185,7 @@ class RecordingService : Service() {
             notifyRunning()
             return
         }
-        val files = Store.pending(this, recordingFile)
+        val files = Store.pending(this)
         if (files.isEmpty()) {
             finishIfIdle()
             return
@@ -182,35 +194,50 @@ class RecordingService : Service() {
         notifyRunning()
 
         worker.execute {
+            val secret = Prefs.secret(this)
             val errors = mutableListOf<String>()
-            var lastNote = ""
+            val started = mutableListOf<String>()
             for (f in files) {
+                val rec = Store.get(this, f.name)
+                rec.phase = Rec.PHASE_UPLOADING
+                rec.note = "Wird hochgeladen …"
+                Store.save(this, rec)
                 status = "Lade hoch: ${f.name}"
                 main.post { notifyRunning() }
                 try {
-                    val result = Uploader.upload(f) { done, total ->
-                        status = "Lade hoch: ${f.name} (${done * 100 / total} %)"
+                    val res = Uploader.upload(f, rec.context, rec.mail, secret) { done, total ->
+                        val pct = done * 100 / total
+                        rec.note = "Wird hochgeladen ($pct %)"
+                        Store.save(this, rec)
+                        status = "Lade hoch: ${f.name} ($pct %)"
                         main.post { notifyRunning() }
                     }
-                    Store.markUploaded(this, f.name, result.note)
-                    lastNote = result.note
+                    rec.fileId = res.fileId
+                    rec.driveName = res.fileName
+                    rec.uploadedAt = System.currentTimeMillis()
+                    rec.phase = Rec.PHASE_TRANSCRIBING
+                    rec.note = res.note
+                    started += f.name
                 } catch (e: Exception) {
-                    val msg = Store.describe(e)
-                    Store.setNote(this, f.name, "Fehler: $msg")
-                    errors += "${f.name}: $msg"
+                    rec.phase = Rec.PHASE_UPLOAD_FAILED
+                    rec.note = Store.describe(e)
+                    errors += "${f.name}: ${Store.describe(e)}"
                 }
+                Store.save(this, rec)
             }
-            Store.cleanup(this, recordingFile)
+            Store.cleanup(this)
 
-            val success = errors.isEmpty()
-            status = if (success) {
-                "✔ Hochgeladen. $lastNote"
+            status = if (errors.isEmpty()) {
+                "✔ Hochgeladen. Transkription läuft."
             } else {
                 "✘ Upload fehlgeschlagen. Die Aufnahme bleibt auf dem Handy.\n" + errors.joinToString("\n")
             }
             busy = false
+            if (started.isNotEmpty()) StatusWorker.schedule(this, 30)
+
             main.post {
-                notifyResult(success, status)
+                if (errors.isNotEmpty()) Notifier.uploadFailed(this, status)
+                if (started.isNotEmpty()) Notifier.transcribing(this, started)
                 finishIfIdle()
             }
         }
@@ -222,18 +249,10 @@ class RecordingService : Service() {
         stopSelf()
     }
 
-    private fun openAppIntent(): PendingIntent =
-        PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
     private fun buildRunningNotification(): Notification {
-        val b = NotificationCompat.Builder(this, CHANNEL_RUNNING)
+        val b = NotificationCompat.Builder(this, Notifier.CH_RUNNING)
             .setSmallIcon(R.drawable.ic_stat_mic)
-            .setContentIntent(openAppIntent())
+            .setContentIntent(Notifier.openApp(this))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
@@ -246,12 +265,12 @@ class RecordingService : Service() {
                 intent(this, ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
-            b.setContentTitle("Aufnahme laeuft")
-                .setContentText("Bildschirm darf aus. Stopp laedt automatisch hoch.")
+            b.setContentTitle("Aufnahme läuft")
+                .setContentText("Bildschirm darf aus.")
                 .setUsesChronometer(true)
                 .setShowWhen(true)
                 .setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - startedAt))
-                .addAction(0, "Stopp & hochladen", stop)
+                .addAction(0, "Stopp", stop)
         } else {
             b.setContentTitle(if (busy) "Lade hoch …" else "Aufnahme")
                 .setContentText(status)
@@ -261,20 +280,7 @@ class RecordingService : Service() {
 
     private fun notifyRunning() {
         if (!isRecording() && !busy) return
-        getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_RUNNING, buildRunningNotification())
-    }
-
-    private fun notifyResult(success: Boolean, text: String) {
-        val n = NotificationCompat.Builder(this, CHANNEL_RESULT)
-            .setSmallIcon(R.drawable.ic_stat_mic)
-            .setContentTitle(if (success) "Hochgeladen, Mail folgt" else "Upload fehlgeschlagen")
-            .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setContentIntent(openAppIntent())
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_RESULT, n)
+        Notifier.post(this, Notifier.ID_RUNNING, buildRunningNotification())
     }
 
     override fun onDestroy() {

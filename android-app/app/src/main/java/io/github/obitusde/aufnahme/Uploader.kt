@@ -7,17 +7,20 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import kotlin.math.min
 
 /**
- * Spricht dieselbe Schnittstelle wie die PWA (apps-script/DirectUpload.gs):
+ * Spricht mit dem Apps Script (apps-script/DirectUpload.gs):
  *
- *   1. initUpload      -> Apps Script eroeffnet eine Drive-Upload-Session
- *   2. PUT der Bytes   -> direkt zu Drive, in 8-MB-Stuecken, mit Wiederholung
- *   3. completeUpload  -> Apps Script startet die Transkription
+ *   hello           -> welche Funktionen kann das Script? Stimmt der Schluessel?
+ *   initUpload      -> Script eroeffnet eine Drive-Upload-Session
+ *   PUT der Bytes   -> direkt zu Drive, in 8-MB-Stuecken, mit Wiederholung
+ *   completeUpload  -> Script startet die Transkription
+ *   status (GET)    -> laeuft / fertig / Fehler (gibt es schon im alten Script)
+ *   transcript      -> fertiges Transkript als Text
  *
- * Kein API-Key in der App. Scheitert nur Schritt 3, liegt die Datei schon in
- * Drive und FolderWatcher.gs startet sie spaetestens nach 10 Minuten.
+ * Kein API-Key und keine Mailadresse in der App.
  */
 object Uploader {
     const val SCRIPT_URL =
@@ -26,30 +29,54 @@ object Uploader {
     private const val MIME = "audio/ogg"
     private const val CHUNK_SIZE = 8 * 1024 * 1024 // Drive verlangt Vielfache von 256 KiB
     private const val MAX_RETRIES = 5
-    private const val FALLBACK_NOTE = "Transkription startet automatisch (spaetestens in 10 Min.)."
+    private const val FALLBACK_NOTE = "Transkription startet automatisch (spätestens in 10 Min.)."
+    private const val AUTH_MESSAGE =
+        "Schlüssel fehlt oder ist falsch. Bitte in der App unter \"Schlüssel einstellen\" prüfen."
 
     class UploadException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-    class Result(val fileId: String, val note: String)
+    class Result(val fileId: String, val fileName: String, val note: String)
+
+    class ServerInfo(
+        val api: Int,
+        val authOk: Boolean,
+        val secretRequired: Boolean,
+        val mailPrivate: Boolean
+    )
 
     private sealed class Step {
         class Done(val fileId: String) : Step()
         class Partial(val next: Long) : Step()
     }
 
-    fun upload(file: File, onProgress: (Long, Long) -> Unit): Result {
+    fun hello(secret: String): ServerInfo {
+        val r = postJson(JSONObject().put("action", "hello").put("secret", secret))
+        if (r.optString("code") == "auth") return ServerInfo(2, false, true, false)
+        // Das alte Script kennt "hello" nicht und antwortet mit einem Fehler ohne "api".
+        return ServerInfo(r.optInt("api", 1), true, r.optBoolean("secretRequired"), r.optBoolean("mailPrivate"))
+    }
+
+    fun upload(
+        file: File,
+        context: String,
+        mail: String,
+        secret: String,
+        onProgress: (Long, Long) -> Unit
+    ): Result {
         val total = file.length()
         if (total <= 0L) throw UploadException("Datei ist leer.")
 
-        val init = retrying(3) {
-            postJson(
-                JSONObject()
-                    .put("action", "initUpload")
-                    .put("filename", file.name)
-                    .put("mimeType", MIME)
-                    .put("size", total)
-            )
-        }
+        val initPayload = JSONObject()
+            .put("action", "initUpload")
+            .put("filename", file.name)
+            .put("mimeType", MIME)
+            .put("size", total)
+            .put("secret", secret)
+            .put("mail", mail)
+        if (context.isNotBlank()) initPayload.put("context", context)
+
+        val init = retrying(3) { postJson(initPayload) }
+        checkAuth(init)
         if (init.optString("status") != "ok") {
             throw UploadException("Apps Script lehnte den Upload ab: " + init.optString("message", init.toString()))
         }
@@ -58,19 +85,44 @@ object Uploader {
 
         val fileId = putFile(uploadUrl, file, total, onProgress)
 
-        // Ab hier ist die Datei sicher in Drive.
+        // Ab hier ist die Datei sicher in Drive. Scheitert der Rest, startet
+        // FolderWatcher.gs die Transkription spaetestens nach 10 Minuten.
         return try {
-            val done = postJson(JSONObject().put("action", "completeUpload").put("fileId", fileId))
+            val done = postJson(
+                JSONObject().put("action", "completeUpload").put("fileId", fileId).put("secret", secret)
+            )
+            checkAuth(done)
             val t = done.optJSONObject("transcription")
             val note = when {
                 t == null -> FALLBACK_NOTE
-                t.optString("status") == "processing" -> "Transkription laeuft, Mail folgt."
+                t.optString("status") == "processing" -> "Transkription läuft …"
                 else -> "Transkription: " + t.optString("message", t.optString("status"))
             }
-            Result(fileId, note)
+            Result(fileId, done.optString("fileName").ifEmpty { file.name }, note)
         } catch (e: Exception) {
-            Result(fileId, FALLBACK_NOTE)
+            Result(fileId, file.name, FALLBACK_NOTE)
         }
+    }
+
+    /** "done", "transcribing", "error" oder "unknown". */
+    fun status(fileName: String): String {
+        val url = SCRIPT_URL + "?action=status&file=" + URLEncoder.encode(fileName, "UTF-8")
+        return getJson(url).optString("state", "unknown")
+    }
+
+    /** Das fertige Transkript, oder null, wenn es (noch) keines gibt. */
+    fun transcript(fileId: String, secret: String): String? {
+        val r = postJson(JSONObject().put("action", "transcript").put("fileId", fileId).put("secret", secret))
+        checkAuth(r)
+        return when (r.optString("status")) {
+            "ok" -> r.optString("text")
+            "missing" -> null
+            else -> throw IOException("Transkript nicht abrufbar: " + r.optString("message", r.toString()))
+        }
+    }
+
+    private fun checkAuth(r: JSONObject) {
+        if (r.optString("code") == "auth") throw UploadException(AUTH_MESSAGE)
     }
 
     private fun putFile(url: String, file: File, total: Long, onProgress: (Long, Long) -> Unit): String {
@@ -150,7 +202,11 @@ object Uploader {
             return when {
                 code == 200 || code == 201 -> {
                     val body = readBody(c)
-                    val id = try { JSONObject(body).optString("id") } catch (e: JSONException) { "" }
+                    val id = try {
+                        JSONObject(body).optString("id")
+                    } catch (e: JSONException) {
+                        ""
+                    }
                     if (id.isEmpty()) throw UploadException("Drive meldete Erfolg, aber keine Datei-ID.")
                     Step.Done(id)
                 }
@@ -166,18 +222,24 @@ object Uploader {
         }
     }
 
-    /**
-     * Apps Script beantwortet POST mit einer Weiterleitung (302) auf
-     * googleusercontent.com, wo das Ergebnis per GET abgeholt wird.
-     */
     private fun postJson(payload: JSONObject): JSONObject {
         val bytes = payload.toString().toByteArray(Charsets.UTF_8)
-        var c = open(SCRIPT_URL, "POST")
+        val c = open(SCRIPT_URL, "POST")
         c.doOutput = true
         c.setFixedLengthStreamingMode(bytes.size)
         c.setRequestProperty("Content-Type", "text/plain;charset=utf-8")
         c.outputStream.use { it.write(bytes) }
+        return readJson(c)
+    }
 
+    private fun getJson(url: String): JSONObject = readJson(open(url, "GET"))
+
+    /**
+     * Apps Script beantwortet jede Anfrage mit einer Weiterleitung (302) auf
+     * googleusercontent.com, wo das Ergebnis per GET abgeholt wird.
+     */
+    private fun readJson(first: HttpURLConnection): JSONObject {
+        var c = first
         var code = c.responseCode
         var hops = 0
         while (code in 300..399 && hops < 5) {
@@ -187,7 +249,6 @@ object Uploader {
             code = c.responseCode
             hops++
         }
-
         val body = readBody(c)
         c.disconnect()
         if (code != 200) throw IOException("Apps Script HTTP $code: ${body.take(200)}")
