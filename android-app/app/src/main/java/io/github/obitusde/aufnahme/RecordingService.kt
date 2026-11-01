@@ -27,6 +27,10 @@ import java.util.concurrent.Executors
  * Nach dem Stopp laedt derselbe Dienst alle wartenden Aufnahmen hoch (nur
  * die mit Transkription "an") und beendet sich dann. Den Fortschritt der
  * Transkription verfolgt danach der StatusWorker.
+ *
+ * Ausserdem laedt er Audio von geteilten Links herunter (ACTION_IMPORT_URL),
+ * damit ein grosser Podcast-Download nicht abbricht, wenn die App in den
+ * Hintergrund geht.
  */
 class RecordingService : Service() {
 
@@ -34,6 +38,9 @@ class RecordingService : Service() {
         const val ACTION_START = "io.github.obitusde.aufnahme.START"
         const val ACTION_STOP = "io.github.obitusde.aufnahme.STOP"
         const val ACTION_UPLOAD = "io.github.obitusde.aufnahme.UPLOAD"
+        const val ACTION_IMPORT_URL = "io.github.obitusde.aufnahme.IMPORT_URL"
+
+        const val EXTRA_URL = "url"
 
         const val EXTRA_MODE = "mode"
         const val EXTRA_CONTEXT = "context"
@@ -52,6 +59,10 @@ class RecordingService : Service() {
             private set
 
         @Volatile
+        var importing: Boolean = false
+            private set
+
+        @Volatile
         var status: String = ""
 
         fun isRecording(): Boolean = recordingFile != null
@@ -64,6 +75,10 @@ class RecordingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
+
+    /** Fortschritt fuer die Benachrichtigung, -1 = unbekannt. */
+    @Volatile
+    private var progressPct = -1
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -82,6 +97,10 @@ class RecordingService : Service() {
             ACTION_UPLOAD -> {
                 goForeground()
                 uploadPending()
+            }
+            ACTION_IMPORT_URL -> {
+                goForeground()
+                importUrl(intent)
             }
             else -> finishIfIdle()
         }
@@ -180,6 +199,49 @@ class RecordingService : Service() {
         uploadPending()
     }
 
+    private fun importUrl(intent: Intent) {
+        val url = intent.getStringExtra(EXTRA_URL)
+        if (url.isNullOrBlank()) {
+            finishIfIdle()
+            return
+        }
+        val mode = intent.getStringExtra(EXTRA_MODE) ?: Rec.MODE_TRANSCRIBE
+        val context = intent.getStringExtra(EXTRA_CONTEXT) ?: ""
+        val mail = intent.getStringExtra(EXTRA_MAIL) ?: Prefs.MAIL_WORK
+
+        importing = true
+        progressPct = -1
+        status = "Lade Datei vom Link …"
+        notifyRunning()
+
+        worker.execute {
+            try {
+                val imported = Importer.download(this, url) { done, total ->
+                    progressPct = if (total > 0) (done * 100 / total).toInt() else -1
+                    status = "Lade Datei vom Link: " + Store.sizeText(done) +
+                        (if (total > 0) " von " + Store.sizeText(total) else "")
+                    main.post { notifyRunning() }
+                }
+                val rec = Rec(imported.file.name)
+                rec.title = imported.title
+                rec.mode = mode
+                rec.context = context
+                rec.mail = mail
+                rec.phase = if (mode == Rec.MODE_LOCAL) Rec.PHASE_LOCAL else Rec.PHASE_NEW
+                Store.save(this, rec)
+                status = "Übernommen: ${imported.title}"
+            } catch (e: Exception) {
+                status = "Link konnte nicht übernommen werden. " + Store.describe(e)
+                val text = status
+                main.post { Notifier.importFailed(this, text) }
+            } finally {
+                importing = false
+                progressPct = -1
+                main.post { uploadPending() }
+            }
+        }
+    }
+
     private fun uploadPending() {
         if (busy) {
             notifyRunning()
@@ -196,20 +258,24 @@ class RecordingService : Service() {
         worker.execute {
             val secret = Prefs.secret(this)
             val errors = mutableListOf<String>()
-            val started = mutableListOf<String>()
+            val started = mutableListOf<Rec>()
             for (f in files) {
                 val rec = Store.get(this, f.name)
                 rec.phase = Rec.PHASE_UPLOADING
                 rec.note = "Wird hochgeladen …"
                 Store.save(this, rec)
-                status = "Lade hoch: ${f.name}"
+                val label = rec.title.ifBlank { f.name }
+                status = "Lade hoch: $label"
+                progressPct = 0
                 main.post { notifyRunning() }
                 try {
                     val res = Uploader.upload(f, rec.context, rec.mail, secret) { done, total ->
-                        val pct = done * 100 / total
+                        val pct = (done * 100 / total).toInt()
                         rec.note = "Wird hochgeladen ($pct %)"
+                        rec.progress = pct
                         Store.save(this, rec)
-                        status = "Lade hoch: ${f.name} ($pct %)"
+                        progressPct = pct
+                        status = "Lade hoch: $label ($pct %)"
                         main.post { notifyRunning() }
                     }
                     rec.fileId = res.fileId
@@ -217,10 +283,12 @@ class RecordingService : Service() {
                     rec.uploadedAt = System.currentTimeMillis()
                     rec.phase = Rec.PHASE_TRANSCRIBING
                     rec.note = res.note
-                    started += f.name
+                    rec.progress = -1
+                    started += rec
                 } catch (e: Exception) {
                     rec.phase = Rec.PHASE_UPLOAD_FAILED
                     rec.note = Store.describe(e)
+                    rec.progress = -1
                     errors += "${f.name}: ${Store.describe(e)}"
                 }
                 Store.save(this, rec)
@@ -233,6 +301,7 @@ class RecordingService : Service() {
                 "✘ Upload fehlgeschlagen. Die Aufnahme bleibt auf dem Handy.\n" + errors.joinToString("\n")
             }
             busy = false
+            progressPct = -1
             if (started.isNotEmpty()) StatusWorker.schedule(this, 30)
 
             main.post {
@@ -244,7 +313,7 @@ class RecordingService : Service() {
     }
 
     private fun finishIfIdle() {
-        if (isRecording() || busy) return
+        if (isRecording() || busy || importing) return
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -272,14 +341,24 @@ class RecordingService : Service() {
                 .setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - startedAt))
                 .addAction(0, "Stopp", stop)
         } else {
-            b.setContentTitle(if (busy) "Lade hoch …" else "Aufnahme")
+            b.setContentTitle(
+                when {
+                    busy -> "Lade hoch …"
+                    importing -> "Lade Datei vom Link …"
+                    else -> "Aufnahme"
+                }
+            )
                 .setContentText(status)
+            if (busy || importing) {
+                val pct = progressPct
+                b.setProgress(100, pct.coerceAtLeast(0), pct < 0)
+            }
         }
         return b.build()
     }
 
     private fun notifyRunning() {
-        if (!isRecording() && !busy) return
+        if (!isRecording() && !busy && !importing) return
         Notifier.post(this, Notifier.ID_RUNNING, buildRunningNotification())
     }
 

@@ -17,7 +17,7 @@ object Prefs {
     const val MAIL_PRIVATE = "private"
     const val MAIL_NONE = "none"
 
-    private const val MAX_RECENT = 8
+    private const val MAX_RECENT = 5
 
     private fun p(context: Context) =
         context.getSharedPreferences("einstellungen", Context.MODE_PRIVATE)
@@ -44,7 +44,7 @@ object Prefs {
         val raw = p(context).getString("recent", null) ?: return emptyList()
         return try {
             val a = JSONArray(raw)
-            (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }
+            (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }.take(MAX_RECENT)
         } catch (e: JSONException) {
             emptyList()
         }
@@ -66,4 +66,13 @@ object Prefs {
     fun setServer(context: Context, api: Int, message: String) {
         p(context).edit().putInt("serverApi", api).putString("serverMessage", message).apply()
     }
+
+    /** Vom Script gemeldete transkribierte Sekunden im laufenden Monat ("2026-11"). */
+    fun setUsage(context: Context, month: String, seconds: Long) {
+        p(context).edit().putString("usageMonth", month).putLong("usageSeconds", seconds).apply()
+    }
+
+    fun usageMonth(context: Context): String = p(context).getString("usageMonth", null) ?: ""
+
+    fun usageSeconds(context: Context): Long = p(context).getLong("usageSeconds", 0L)
 }

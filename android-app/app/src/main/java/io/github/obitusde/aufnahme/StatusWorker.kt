@@ -38,7 +38,7 @@ class StatusWorker(context: Context, params: WorkerParameters) : Worker(context,
         Notifier.ensureChannels(c)
         val secret = Prefs.secret(c)
         val now = System.currentTimeMillis()
-        val running = mutableListOf<String>()
+        val running = mutableListOf<Rec>()
         var again = false
 
         for (rec in Store.awaitingStatus(c)) {
@@ -87,7 +87,7 @@ class StatusWorker(context: Context, params: WorkerParameters) : Worker(context,
             }
 
             Store.save(c, rec)
-            if (rec.phase == Rec.PHASE_TRANSCRIBING) running += rec.name
+            if (rec.phase == Rec.PHASE_TRANSCRIBING) running += rec
             if (Store.needsStatus(c, rec)) again = true
             if (before == Rec.PHASE_TRANSCRIBING && rec.phase != before) Notifier.finished(c, rec)
         }

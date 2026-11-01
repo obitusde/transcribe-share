@@ -20,6 +20,10 @@ class Rec(val name: String) {
     var driveName = ""
     var hasTxt = false
     var txtTries = 0
+    /** Anzeigename bei uebernommenen Dateien (z. B. Titel der Podcast-Folge). */
+    var title = ""
+    /** Upload-Fortschritt in Prozent, -1 = unbekannt. */
+    var progress = -1
 
     fun toJson(): String = JSONObject()
         .put("mode", mode)
@@ -32,6 +36,8 @@ class Rec(val name: String) {
         .put("driveName", driveName)
         .put("hasTxt", hasTxt)
         .put("txtTries", txtTries)
+        .put("title", title)
+        .put("progress", progress)
         .toString()
 
     companion object {
@@ -62,6 +68,8 @@ class Rec(val name: String) {
                     driveName = o.optString("driveName", "")
                     hasTxt = o.optBoolean("hasTxt", false)
                     txtTries = o.optInt("txtTries", 0)
+                    title = o.optString("title", "")
+                    progress = o.optInt("progress", -1)
                 }
             } catch (e: JSONException) {
                 null
@@ -81,14 +89,30 @@ object Store {
     const val KEEP_DAYS = 7
     private const val DAY_MS = 24L * 60 * 60 * 1000
 
+    /** Formate, die das Apps Script transkribiert (isAudioFile in Code.gs). */
+    private val AUDIO_MIME = mapOf(
+        "ogg" to "audio/ogg",
+        "m4a" to "audio/mp4",
+        "mp3" to "audio/mpeg",
+        "wav" to "audio/wav"
+    )
+
+    fun mimeFor(f: File): String = AUDIO_MIME[f.extension.lowercase()] ?: "application/octet-stream"
+
     fun dir(context: Context): File = File(context.filesDir, "recordings").apply { mkdirs() }
 
     private fun txtDir(context: Context): File = File(context.filesDir, "transcripts").apply { mkdirs() }
 
     /** Name im selben Schema, das das Apps Script ohnehin verwendet. */
-    fun newFile(context: Context): File {
+    fun newFile(context: Context, ext: String = "ogg"): File {
         val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
-        return File(dir(context), "$stamp.ogg")
+        var f = File(dir(context), "$stamp.$ext")
+        var n = 2
+        while (f.exists()) {
+            f = File(dir(context), "$stamp-$n.$ext")
+            n++
+        }
+        return f
     }
 
     fun txtFile(context: Context, name: String): File =
@@ -96,7 +120,7 @@ object Store {
 
     fun all(context: Context): List<File> =
         dir(context).listFiles()
-            ?.filter { it.isFile && it.name.endsWith(".ogg") }
+            ?.filter { it.isFile && it.extension.lowercase() in AUDIO_MIME }
             ?.sortedByDescending { it.name }
             ?: emptyList()
 
@@ -168,8 +192,10 @@ object Store {
         }
     }
 
-    fun sizeText(f: File): String =
-        String.format(Locale.GERMANY, "%.1f MB", f.length() / 1_048_576.0)
+    fun sizeText(f: File): String = sizeText(f.length())
+
+    fun sizeText(bytes: Long): String =
+        String.format(Locale.GERMANY, "%.1f MB", bytes / 1_048_576.0)
 
     fun mailLabel(mail: String): String = when (mail) {
         Prefs.MAIL_PRIVATE -> "Privat"
@@ -181,11 +207,18 @@ object Store {
         Rec.PHASE_NEW -> "Wartet auf Upload"
         Rec.PHASE_UPLOADING -> r.note.ifEmpty { "Wird hochgeladen …" }
         Rec.PHASE_UPLOAD_FAILED -> "✘ Upload fehlgeschlagen. " + r.note
-        Rec.PHASE_TRANSCRIBING -> "⏳ " + r.note.ifEmpty { "Transkription läuft …" }
+        Rec.PHASE_TRANSCRIBING -> "⏳ " + r.note.ifEmpty { "Transkription läuft …" } + since(r)
         Rec.PHASE_DONE -> "✔ " + r.note.ifEmpty { "Fertig." }
         Rec.PHASE_FAILED -> "✘ " + r.note
         Rec.PHASE_LOCAL -> "Nur auf dem Handy (nicht übertragen)"
         else -> r.note
+    }
+
+    /** " (seit 3 Min.)" fuer laufende Transkriptionen. */
+    fun since(r: Rec): String {
+        if (r.uploadedAt <= 0L) return ""
+        val minutes = (System.currentTimeMillis() - r.uploadedAt) / 60_000L
+        return if (minutes < 1) " (seit gerade eben)" else " (seit $minutes Min.)"
     }
 
     fun details(r: Rec, isActive: Boolean): String {

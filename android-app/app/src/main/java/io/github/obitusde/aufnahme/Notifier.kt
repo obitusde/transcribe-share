@@ -43,16 +43,26 @@ object Notifier {
         post(context, ID_UPLOAD, result(context, "Upload fehlgeschlagen", text))
     }
 
-    /** Laufende Transkriptionen; leere Liste nimmt die Meldung weg. */
-    fun transcribing(context: Context, names: List<String>) {
-        if (names.isEmpty()) {
+    fun importFailed(context: Context, text: String) {
+        post(context, ID_UPLOAD, result(context, "Übernahme fehlgeschlagen", text))
+    }
+
+    /**
+     * Laufende Transkriptionen mit laufendem Balken (AssemblyAI meldet keinen
+     * Prozentwert) und "seit X Min.". Leere Liste nimmt die Meldung weg.
+     */
+    fun transcribing(context: Context, recs: List<Rec>) {
+        if (recs.isEmpty()) {
             manager(context).cancel(ID_STATUS)
             return
         }
+        val text = recs.joinToString("\n") { r -> r.title.ifBlank { r.name } + Store.since(r) }
         val n = NotificationCompat.Builder(context, CH_STATUS)
             .setSmallIcon(R.drawable.ic_stat_mic)
             .setContentTitle("Transkription läuft")
-            .setContentText(names.joinToString(", "))
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setProgress(0, 0, true)
             .setContentIntent(openApp(context))
             .setOnlyAlertOnce(true)
             .setSilent(true)
@@ -62,7 +72,8 @@ object Notifier {
 
     fun finished(context: Context, r: Rec) {
         val title = if (r.phase == Rec.PHASE_DONE) "Transkript fertig" else "Transkription fehlgeschlagen"
-        post(context, 1000 + (r.name.hashCode() and 0xFFFF), result(context, title, "${r.name}: ${r.note}"))
+        val label = r.title.ifBlank { r.name }
+        post(context, 1000 + (r.name.hashCode() and 0xFFFF), result(context, title, "$label: ${r.note}"))
     }
 
     private fun result(context: Context, title: String, text: String): Notification =

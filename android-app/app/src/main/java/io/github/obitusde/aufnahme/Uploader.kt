@@ -26,7 +26,6 @@ object Uploader {
     const val SCRIPT_URL =
         "https://script.google.com/macros/s/AKfycbxkkdYTJi24p-f0BY9M3SbnpPYEBQcxjclpJ3K1pUKbolUqb4DpuaM7XfAwE5KRHWc8ig/exec"
 
-    private const val MIME = "audio/ogg"
     private const val CHUNK_SIZE = 8 * 1024 * 1024 // Drive verlangt Vielfache von 256 KiB
     private const val MAX_RETRIES = 5
     private const val FALLBACK_NOTE = "Transkription startet automatisch (spätestens in 10 Min.)."
@@ -41,7 +40,9 @@ object Uploader {
         val api: Int,
         val authOk: Boolean,
         val secretRequired: Boolean,
-        val mailPrivate: Boolean
+        val mailPrivate: Boolean,
+        val month: String,
+        val monthSeconds: Long
     )
 
     private sealed class Step {
@@ -51,9 +52,16 @@ object Uploader {
 
     fun hello(secret: String): ServerInfo {
         val r = postJson(JSONObject().put("action", "hello").put("secret", secret))
-        if (r.optString("code") == "auth") return ServerInfo(2, false, true, false)
+        if (r.optString("code") == "auth") return ServerInfo(2, false, true, false, "", 0L)
         // Das alte Script kennt "hello" nicht und antwortet mit einem Fehler ohne "api".
-        return ServerInfo(r.optInt("api", 1), true, r.optBoolean("secretRequired"), r.optBoolean("mailPrivate"))
+        return ServerInfo(
+            r.optInt("api", 1),
+            true,
+            r.optBoolean("secretRequired"),
+            r.optBoolean("mailPrivate"),
+            r.optString("month", ""),
+            r.optLong("monthSeconds", 0L)
+        )
     }
 
     fun upload(
@@ -65,11 +73,12 @@ object Uploader {
     ): Result {
         val total = file.length()
         if (total <= 0L) throw UploadException("Datei ist leer.")
+        val mime = Store.mimeFor(file)
 
         val initPayload = JSONObject()
             .put("action", "initUpload")
             .put("filename", file.name)
-            .put("mimeType", MIME)
+            .put("mimeType", mime)
             .put("size", total)
             .put("secret", secret)
             .put("mail", mail)
@@ -83,7 +92,7 @@ object Uploader {
         val uploadUrl = init.optString("uploadUrl")
         if (uploadUrl.isEmpty()) throw UploadException("Apps Script lieferte keine Upload-Adresse.")
 
-        val fileId = putFile(uploadUrl, file, total, onProgress)
+        val fileId = putFile(uploadUrl, file, total, mime, onProgress)
 
         // Ab hier ist die Datei sicher in Drive. Scheitert der Rest, startet
         // FolderWatcher.gs die Transkription spaetestens nach 10 Minuten.
@@ -125,7 +134,7 @@ object Uploader {
         if (r.optString("code") == "auth") throw UploadException(AUTH_MESSAGE)
     }
 
-    private fun putFile(url: String, file: File, total: Long, onProgress: (Long, Long) -> Unit): String {
+    private fun putFile(url: String, file: File, total: Long, mime: String, onProgress: (Long, Long) -> Unit): String {
         var offset = 0L
         var failures = 0
         val buffer = ByteArray(CHUNK_SIZE)
@@ -139,7 +148,7 @@ object Uploader {
                         val len = min(CHUNK_SIZE.toLong(), total - offset).toInt()
                         raf.seek(offset)
                         raf.readFully(buffer, 0, len)
-                        putChunk(url, buffer, len, offset, total)
+                        putChunk(url, buffer, len, offset, total, mime)
                     }
                 } catch (e: IOException) {
                     failures++
@@ -176,11 +185,11 @@ object Uploader {
         }
     }
 
-    private fun putChunk(url: String, buffer: ByteArray, len: Int, offset: Long, total: Long): Step {
+    private fun putChunk(url: String, buffer: ByteArray, len: Int, offset: Long, total: Long, mime: String): Step {
         val c = open(url, "PUT")
         c.doOutput = true
         c.setFixedLengthStreamingMode(len)
-        c.setRequestProperty("Content-Type", MIME)
+        c.setRequestProperty("Content-Type", mime)
         c.setRequestProperty("Content-Range", "bytes $offset-${offset + len - 1}/$total")
         c.outputStream.use { it.write(buffer, 0, len) }
         return readStep(c)
