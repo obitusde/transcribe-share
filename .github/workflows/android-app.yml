@@ -1,0 +1,44 @@
+name: Android-App bauen
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/android-app.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Signierschluessel auspacken
+        run: base64 -d android-app/signing/release.jks.b64 > android-app/signing/release.jks
+
+      - name: APK bauen
+        run: gradle -p android-app --no-daemon assembleRelease -PbuildNumber=${{ github.run_number }}
+
+      - name: Als Release veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android-app/app/build/outputs/apk/release/app-release.apk Aufnahme.apk
+          gh release create "app-${{ github.run_number }}" Aufnahme.apk \
+            --target "${{ github.sha }}" \
+            --title "Aufnahme-App, Build ${{ github.run_number }}" \
+            --notes "Auf dem Handy herunterladen und antippen. Installiert sich ueber die vorherige Version." \
+            --latest
