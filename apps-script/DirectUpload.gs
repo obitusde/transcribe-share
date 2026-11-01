@@ -15,6 +15,10 @@
  *     CONFIG.TARGET_EMAIL aus Code.gs.
  *   - Jedes fertige Transkript wird zusaetzlich als .txt im Drive-Ordner
  *     "Transkripte" abgelegt (neben "Archive"). Von dort holt die App es ab.
+ *   - Transkribierte Minuten pro Monat werden mitgezaehlt (Skripteigenschaft
+ *     USAGE_JJJJ-MM, von AssemblyAI gemeldete Audiolaenge). Die App zeigt
+ *     den laufenden Monat an. Zaehlt auch Aufnahmen, die nicht ueber die App
+ *     kamen.
  *
  * Kontext und Mail-Auswahl reisen in der Drive-Beschreibung der Audiodatei
  * mit (letzte Zeile "#app mail=..."). So gehen sie nicht verloren, egal ob
@@ -40,6 +44,7 @@ var APP_MAIL_CHOICES = ['work', 'private', 'none'];
 var APP_CONTEXT_MAX = 500;
 var APP_MARKER_RE = /(?:^|\n)#app mail=(work|private|none)\s*$/;
 var TRANSCRIPT_FOLDER_NAME = 'Transkripte';
+var USAGE_TZ = 'Europe/Zurich';
 
 /**
  * Router, aufgerufen ganz oben in doPost().
@@ -88,11 +93,14 @@ function getUploadSecret_() {
 /** Die App prueft damit, welche Funktionen das Script schon kann. */
 function hello_() {
   var props = PropertiesService.getScriptProperties();
+  var now = new Date();
   return {
     status: 'ok',
     api: APP_API_VERSION,
     secretRequired: !!getUploadSecret_(),
-    mailPrivate: !!props.getProperty('MAIL_PRIVATE')
+    mailPrivate: !!props.getProperty('MAIL_PRIVATE'),
+    month: Utilities.formatDate(now, USAGE_TZ, 'yyyy-MM'),
+    monthSeconds: Number(props.getProperty(usageKey_(now)) || 0)
   };
 }
 
@@ -279,9 +287,10 @@ function applyAppOptions_(file, payload) {
  * Legt zuerst die .txt in Drive ab (darf scheitern, ohne die Mail zu
  * verhindern) und schickt dann die Mail an die gewaehlte Adresse - oder gar
  * keine. Wirft, wenn die Mail scheitert: dann versucht der Status-Trigger es
- * spaeter erneut, genau wie bisher.
+ * spaeter erneut, genau wie bisher. Die Minuten werden erst NACH der Mail
+ * gezaehlt, damit ein Wiederholungslauf sie nicht doppelt zaehlt.
  */
-function deliverTranscript_(file, fileName, transcriptText, summaryInfo, confidence) {
+function deliverTranscript_(file, fileName, transcriptText, summaryInfo, confidence, statusData) {
   var opts = readAppOptions_(file);
   var text = opts.context ? 'Kontext: ' + opts.context + '\n\n' + transcriptText : transcriptText;
 
@@ -296,6 +305,28 @@ function deliverTranscript_(file, fileName, transcriptText, summaryInfo, confide
     sendEmailTranscriptOnly(recipient, fileName, text, file.getLastUpdated(), summaryInfo, confidence);
   } else {
     Logger.log('Keine Mail fuer "' + fileName + '" (so in der App gewaehlt).');
+  }
+
+  addUsage_(statusData);
+}
+
+// --- Minuten pro Monat ---------------------------------------------------
+
+function usageKey_(date) {
+  return 'USAGE_' + Utilities.formatDate(date, USAGE_TZ, 'yyyy-MM');
+}
+
+/** Zaehlt die Audiolaenge eines fertigen Transkripts zum laufenden Monat. */
+function addUsage_(statusData) {
+  try {
+    var seconds = statusData && Number(statusData.audio_duration);
+    if (!seconds || seconds <= 0) return;
+    var props = PropertiesService.getScriptProperties();
+    var key = usageKey_(new Date());
+    var before = Number(props.getProperty(key) || 0);
+    props.setProperty(key, String(Math.round(before + seconds)));
+  } catch (err) {
+    Logger.log('Minuten konnten nicht gezaehlt werden: ' + err.message);
   }
 }
 

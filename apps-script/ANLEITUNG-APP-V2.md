@@ -1,7 +1,7 @@
 # Script-Update für die Aufnahme-App (Version 2)
 
 Damit funktionieren in der App: **Kontext**, **Mail-Auswahl (Arbeit / Privat / keine)**,
-**TXT-Download** und der **Schlüssel-Schutz**. Ohne dieses Update läuft die App trotzdem.
+**TXT-Download**, die **Minuten pro Monat** und der **Schlüssel-Schutz**. Ohne dieses Update läuft die App trotzdem.
 Dann gehen alle Mails wie bisher an die Arbeitsadresse.
 
 Dauer: etwa 10 Minuten am PC, im Browser auf script.google.com.
@@ -66,7 +66,7 @@ In **Code** mit Strg+F diese Zeile suchen (in `finalizeCompletedTranscript`):
 Die **ganze Zeile ersetzen** durch:
 
 ```js
-      deliverTranscript_(file, fileName, transcriptText, summaryInfo, confidence);
+      deliverTranscript_(file, fileName, transcriptText, summaryInfo, confidence, statusData);
 ```
 
 Speichern (Strg+S).
@@ -108,3 +108,5 @@ Dann eine kurze Testaufnahme mit Kontext und „Mail an: Privat“ machen.
   (neben „Archive“). Von dort holt die App sie, und du kannst sie auch im Browser öffnen.
 - **Aufnahmen ohne App** (Recorder → Drive) laufen wie bisher: Mail an die Arbeitsadresse.
 - **Fehler-Mails** gehen wie bisher an `TARGET_EMAIL`.
+- **Minuten pro Monat** stehen in den Skripteigenschaften als `USAGE_2026-11` usw.
+  (in Sekunden). Gezählt wird ab dem Update, auch für Recorder-Aufnahmen über Drive.
