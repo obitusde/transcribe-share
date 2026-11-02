@@ -42,7 +42,8 @@ object Uploader {
         val secretRequired: Boolean,
         val mailPrivate: Boolean,
         val month: String,
-        val monthSeconds: Long
+        val monthSeconds: Long,
+        val archiveDays: Int
     )
 
     private sealed class Step {
@@ -52,7 +53,7 @@ object Uploader {
 
     fun hello(secret: String): ServerInfo {
         val r = postJson(JSONObject().put("action", "hello").put("secret", secret))
-        if (r.optString("code") == "auth") return ServerInfo(2, false, true, false, "", 0L)
+        if (r.optString("code") == "auth") return ServerInfo(2, false, true, false, "", 0L, 0)
         // Das alte Script kennt "hello" nicht und antwortet mit einem Fehler ohne "api".
         return ServerInfo(
             r.optInt("api", 1),
@@ -60,7 +61,8 @@ object Uploader {
             r.optBoolean("secretRequired"),
             r.optBoolean("mailPrivate"),
             r.optString("month", ""),
-            r.optLong("monthSeconds", 0L)
+            r.optLong("monthSeconds", 0L),
+            r.optInt("archiveDays", 0)
         )
     }
 

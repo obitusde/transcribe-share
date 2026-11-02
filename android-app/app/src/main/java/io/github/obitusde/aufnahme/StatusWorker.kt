@@ -80,6 +80,8 @@ class StatusWorker(context: Context, params: WorkerParameters) : Worker(context,
                     if (text != null) {
                         Store.txtFile(c, rec.name).writeText(text)
                         rec.hasTxt = true
+                        // Transkript ist sicher auf dem Handy: Aufnahme wird nicht mehr gebraucht.
+                        Store.deleteAudio(c, rec)
                     }
                 } catch (e: Exception) {
                     // naechster Versuch beim naechsten Lauf
@@ -102,9 +104,9 @@ class StatusWorker(context: Context, params: WorkerParameters) : Worker(context,
             "Fertig. Mail verschickt."
         } else {
             when (r.mail) {
-                Prefs.MAIL_NONE -> "Fertig. Keine Mail verschickt."
-                Prefs.MAIL_PRIVATE -> "Fertig. Mail an Privat verschickt."
-                else -> "Fertig. Mail an Arbeit verschickt."
+                Prefs.MAIL_NONE -> "Fertig. Keine Mail."
+                Prefs.MAIL_PRIVATE -> "Fertig. Mail an Privat."
+                else -> "Fertig. Mail an Arbeit."
             }
         }
 }

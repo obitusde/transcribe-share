@@ -22,11 +22,14 @@ import java.util.concurrent.Executors
  * Nimmt im Vordergrund-Dienst (Typ "microphone") auf. Nur so darf Android
  * bei ausgeschaltetem Bildschirm weiter aufnehmen. Der Dienst muss gestartet
  * werden, solange die App sichtbar ist - deshalb startet die Aufnahme immer
- * ueber den Knopf in der App.
+ * ueber den Knopf in der App. Pause, Weiter und Stopp gehen auch ueber die
+ * Benachrichtigung.
  *
- * Nach dem Stopp laedt derselbe Dienst alle wartenden Aufnahmen hoch (nur
- * die mit Transkription "an") und beendet sich dann. Den Fortschritt der
- * Transkription verfolgt danach der StatusWorker.
+ * Nach dem Stopp passiert NICHTS automatisch: Die Aufnahme ist "offen", bis
+ * in der App entschieden wird (Transkribieren, lokal behalten, Teilen,
+ * Loeschen). Bei "Transkribieren" laedt derselbe Dienst hoch
+ * (ACTION_UPLOAD); den Fortschritt der Transkription verfolgt danach der
+ * StatusWorker.
  *
  * Ausserdem laedt er Audio von geteilten Links herunter (ACTION_IMPORT_URL),
  * damit ein grosser Podcast-Download nicht abbricht, wenn die App in den
@@ -36,23 +39,29 @@ class RecordingService : Service() {
 
     companion object {
         const val ACTION_START = "io.github.obitusde.aufnahme.START"
+        const val ACTION_PAUSE = "io.github.obitusde.aufnahme.PAUSE"
+        const val ACTION_RESUME = "io.github.obitusde.aufnahme.RESUME"
         const val ACTION_STOP = "io.github.obitusde.aufnahme.STOP"
         const val ACTION_UPLOAD = "io.github.obitusde.aufnahme.UPLOAD"
         const val ACTION_IMPORT_URL = "io.github.obitusde.aufnahme.IMPORT_URL"
 
         const val EXTRA_URL = "url"
 
-        const val EXTRA_MODE = "mode"
-        const val EXTRA_CONTEXT = "context"
-        const val EXTRA_MAIL = "mail"
-
         @Volatile
         var recordingFile: File? = null
             private set
 
+        /** elapsedRealtime beim Start. */
         @Volatile
-        var startedAt: Long = 0L
-            private set
+        private var startedAt: Long = 0L
+
+        /** elapsedRealtime beim Pausieren, 0 = laeuft. */
+        @Volatile
+        private var pausedAt: Long = 0L
+
+        /** Summe aller bisherigen Pausen in ms. */
+        @Volatile
+        private var pausedTotal: Long = 0L
 
         @Volatile
         var busy: Boolean = false
@@ -62,10 +71,36 @@ class RecordingService : Service() {
         var importing: Boolean = false
             private set
 
+        /** Fortschritt des Link-Downloads in Prozent, -1 = unbekannt. */
+        @Volatile
+        var importPct: Int = -1
+            private set
+
+        /** Kurze Meldung fuer die App (Fehler, Upload, Link-Download). */
         @Volatile
         var status: String = ""
+            private set
+
+        /** Wann die Meldung kam (elapsedRealtime). Die App blendet alte Meldungen aus. */
+        @Volatile
+        var statusAt: Long = 0L
+            private set
+
+        fun report(text: String) {
+            status = text
+            statusAt = SystemClock.elapsedRealtime()
+        }
 
         fun isRecording(): Boolean = recordingFile != null
+
+        fun isPaused(): Boolean = recordingFile != null && pausedAt > 0L
+
+        /** Aufgenommene Zeit ohne Pausen. */
+        fun elapsedMs(): Long {
+            if (recordingFile == null) return 0L
+            val end = if (pausedAt > 0L) pausedAt else SystemClock.elapsedRealtime()
+            return (end - startedAt - pausedTotal).coerceAtLeast(0L)
+        }
 
         fun intent(context: Context, action: String): Intent =
             Intent(context, RecordingService::class.java).setAction(action)
@@ -76,7 +111,7 @@ class RecordingService : Service() {
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
 
-    /** Fortschritt fuer die Benachrichtigung, -1 = unbekannt. */
+    /** Upload-Fortschritt fuer die Benachrichtigung, -1 = unbekannt. */
     @Volatile
     private var progressPct = -1
 
@@ -91,8 +126,10 @@ class RecordingService : Service() {
         when (intent?.action) {
             ACTION_START -> {
                 goForeground()
-                startRecording(intent)
+                startRecording()
             }
+            ACTION_PAUSE -> pauseRecording()
+            ACTION_RESUME -> resumeRecording()
             ACTION_STOP -> stopRecording()
             ACTION_UPLOAD -> {
                 goForeground()
@@ -120,7 +157,7 @@ class RecordingService : Service() {
     private fun newRecorder(): MediaRecorder =
         if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
 
-    private fun startRecording(intent: Intent) {
+    private fun startRecording() {
         if (isRecording()) {
             notifyRunning()
             return
@@ -140,22 +177,22 @@ class RecordingService : Service() {
         } catch (e: Exception) {
             r.release()
             file.delete()
-            status = "Aufnahme konnte nicht starten. " + Store.describe(e)
+            report("Aufnahme konnte nicht starten. " + Store.describe(e))
             finishIfIdle()
             return
         }
 
         val rec = Rec(file.name)
-        rec.mode = intent.getStringExtra(EXTRA_MODE) ?: Rec.MODE_TRANSCRIBE
-        rec.context = intent.getStringExtra(EXTRA_CONTEXT) ?: ""
-        rec.mail = intent.getStringExtra(EXTRA_MAIL) ?: Prefs.MAIL_WORK
         rec.phase = Rec.PHASE_RECORDING
+        rec.createdAt = System.currentTimeMillis()
         Store.save(this, rec)
 
         recorder = r
         startedAt = SystemClock.elapsedRealtime()
+        pausedAt = 0L
+        pausedTotal = 0L
         recordingFile = file
-        status = "Aufnahme läuft. Der Bildschirm darf aus."
+        report("")
 
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Aufnahme:recording").apply {
@@ -165,9 +202,41 @@ class RecordingService : Service() {
         notifyRunning()
     }
 
+    private fun pauseRecording() {
+        val r = recorder
+        if (r == null || pausedAt > 0L) {
+            finishIfIdle()
+            return
+        }
+        try {
+            r.pause()
+            pausedAt = SystemClock.elapsedRealtime()
+        } catch (e: Exception) {
+            report("Pause ging nicht. " + Store.describe(e))
+        }
+        notifyRunning()
+    }
+
+    private fun resumeRecording() {
+        val r = recorder
+        if (r == null || pausedAt == 0L) {
+            finishIfIdle()
+            return
+        }
+        try {
+            r.resume()
+            pausedTotal += SystemClock.elapsedRealtime() - pausedAt
+            pausedAt = 0L
+        } catch (e: Exception) {
+            report("Weiter ging nicht. " + Store.describe(e))
+        }
+        notifyRunning()
+    }
+
     private fun stopRecording() {
         val r = recorder
         val file = recordingFile
+        val duration = elapsedMs()
         recorder = null
         var kept = false
         if (r != null) {
@@ -180,64 +249,63 @@ class RecordingService : Service() {
             r.release()
         }
         recordingFile = null
+        pausedAt = 0L
+        pausedTotal = 0L
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
 
         if (file != null) {
             if (kept && file.length() > 0L) {
-                // Optionen frisch lesen: die App kann sie waehrend der Aufnahme geaendert haben.
                 val rec = Store.get(this, file.name)
-                val local = rec.mode == Rec.MODE_LOCAL
-                rec.phase = if (local) Rec.PHASE_LOCAL else Rec.PHASE_NEW
+                rec.phase = Rec.PHASE_OPEN
+                rec.durationMs = duration
+                rec.sizeBytes = file.length()
                 Store.save(this, rec)
-                status = if (local) "Gespeichert, nur auf dem Handy: ${file.name}" else "Gespeichert: ${file.name}"
+                Prefs.setFocus(this, rec.name)
+                report("")
+                if (!MainActivity.visible) Notifier.decide(this, rec)
             } else {
                 Store.deleteRecording(this, file.name)
-                status = "Aufnahme war zu kurz und wurde verworfen."
+                report("Aufnahme war zu kurz und wurde verworfen.")
             }
         }
-        uploadPending()
+        finishIfIdle()
     }
 
     private fun importUrl(intent: Intent) {
         val url = intent.getStringExtra(EXTRA_URL)
-        if (url.isNullOrBlank()) {
+        if (url.isNullOrBlank() || importing) {
             finishIfIdle()
             return
         }
-        val mode = intent.getStringExtra(EXTRA_MODE) ?: Rec.MODE_TRANSCRIBE
-        val context = intent.getStringExtra(EXTRA_CONTEXT) ?: ""
-        val mail = intent.getStringExtra(EXTRA_MAIL) ?: Prefs.MAIL_WORK
 
         importing = true
-        progressPct = -1
-        status = "Lade Datei vom Link …"
+        importPct = -1
+        report("Lade Datei vom Link …")
         notifyRunning()
 
         worker.execute {
             try {
                 val imported = Importer.download(this, url) { done, total ->
-                    progressPct = if (total > 0) (done * 100 / total).toInt() else -1
-                    status = "Lade Datei vom Link: " + Store.sizeText(done) +
-                        (if (total > 0) " von " + Store.sizeText(total) else "")
+                    importPct = if (total > 0) (done * 100 / total).toInt() else -1
+                    report(
+                        "Lade Datei vom Link: " + Store.sizeText(done) +
+                            (if (total > 0) " von " + Store.sizeText(total) else "")
+                    )
                     main.post { notifyRunning() }
                 }
-                val rec = Rec(imported.file.name)
-                rec.title = imported.title
-                rec.mode = mode
-                rec.context = context
-                rec.mail = mail
-                rec.phase = if (mode == Rec.MODE_LOCAL) Rec.PHASE_LOCAL else Rec.PHASE_NEW
-                Store.save(this, rec)
-                status = "Übernommen: ${imported.title}"
+                val rec = Store.newImported(this, imported)
+                Prefs.setFocus(this, rec.name)
+                report("")
+                main.post { if (!MainActivity.visible) Notifier.decide(this, rec) }
             } catch (e: Exception) {
-                status = "Link konnte nicht übernommen werden. " + Store.describe(e)
+                report("Link konnte nicht übernommen werden. " + Store.describe(e))
                 val text = status
                 main.post { Notifier.importFailed(this, text) }
             } finally {
                 importing = false
-                progressPct = -1
-                main.post { uploadPending() }
+                importPct = -1
+                main.post { finishIfIdle() }
             }
         }
     }
@@ -263,9 +331,10 @@ class RecordingService : Service() {
                 val rec = Store.get(this, f.name)
                 rec.phase = Rec.PHASE_UPLOADING
                 rec.note = "Wird hochgeladen …"
+                rec.progress = 0
                 Store.save(this, rec)
-                val label = rec.title.ifBlank { f.name }
-                status = "Lade hoch: $label"
+                val label = Store.label(rec)
+                report("Lade hoch: $label")
                 progressPct = 0
                 main.post { notifyRunning() }
                 try {
@@ -275,7 +344,6 @@ class RecordingService : Service() {
                         rec.progress = pct
                         Store.save(this, rec)
                         progressPct = pct
-                        status = "Lade hoch: $label ($pct %)"
                         main.post { notifyRunning() }
                     }
                     rec.fileId = res.fileId
@@ -289,23 +357,21 @@ class RecordingService : Service() {
                     rec.phase = Rec.PHASE_UPLOAD_FAILED
                     rec.note = Store.describe(e)
                     rec.progress = -1
-                    errors += "${f.name}: ${Store.describe(e)}"
+                    errors += "${Store.label(rec)}: ${Store.describe(e)}"
                 }
                 Store.save(this, rec)
             }
             Store.cleanup(this)
 
-            status = if (errors.isEmpty()) {
-                "✔ Hochgeladen. Transkription läuft."
-            } else {
-                "✘ Upload fehlgeschlagen. Die Aufnahme bleibt auf dem Handy.\n" + errors.joinToString("\n")
-            }
+            report(
+                if (errors.isEmpty()) "" else "Upload fehlgeschlagen. Die Aufnahme bleibt auf dem Handy."
+            )
             busy = false
             progressPct = -1
             if (started.isNotEmpty()) StatusWorker.schedule(this, 30)
 
             main.post {
-                if (errors.isNotEmpty()) Notifier.uploadFailed(this, status)
+                if (errors.isNotEmpty()) Notifier.uploadFailed(this, errors.joinToString("\n"))
                 if (started.isNotEmpty()) Notifier.transcribing(this, started)
                 finishIfIdle()
             }
@@ -318,6 +384,14 @@ class RecordingService : Service() {
         stopSelf()
     }
 
+    private fun action(code: Int, action: String): PendingIntent =
+        PendingIntent.getService(
+            this,
+            code,
+            intent(this, action),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
     private fun buildRunningNotification(): Notification {
         val b = NotificationCompat.Builder(this, Notifier.CH_RUNNING)
             .setSmallIcon(R.drawable.ic_stat_mic)
@@ -327,34 +401,40 @@ class RecordingService : Service() {
             .setSilent(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
 
-        if (isRecording()) {
-            val stop = PendingIntent.getService(
-                this,
-                1,
-                intent(this, ACTION_STOP),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-            )
-            b.setContentTitle("Aufnahme läuft")
+        when {
+            isPaused() -> b.setContentTitle("Aufnahme pausiert")
+                .setContentText("Bei " + formatElapsed(elapsedMs()) + ". Tippe auf Weiter.")
+                .setUsesChronometer(false)
+                .setShowWhen(false)
+                .addAction(0, "Weiter", action(2, ACTION_RESUME))
+                .addAction(0, "Stopp", action(1, ACTION_STOP))
+            isRecording() -> b.setContentTitle("Aufnahme läuft")
                 .setContentText("Bildschirm darf aus.")
                 .setUsesChronometer(true)
                 .setShowWhen(true)
-                .setWhen(System.currentTimeMillis() - (SystemClock.elapsedRealtime() - startedAt))
-                .addAction(0, "Stopp", stop)
-        } else {
-            b.setContentTitle(
-                when {
-                    busy -> "Lade hoch …"
-                    importing -> "Lade Datei vom Link …"
-                    else -> "Aufnahme"
-                }
-            )
-                .setContentText(status)
-            if (busy || importing) {
+                .setWhen(System.currentTimeMillis() - elapsedMs())
+                .addAction(0, "Pause", action(3, ACTION_PAUSE))
+                .addAction(0, "Stopp", action(1, ACTION_STOP))
+            busy -> {
                 val pct = progressPct
-                b.setProgress(100, pct.coerceAtLeast(0), pct < 0)
+                b.setContentTitle("Lade hoch …")
+                    .setContentText(if (pct >= 0) "$pct %" else "")
+                    .setProgress(100, pct.coerceAtLeast(0), pct < 0)
             }
+            importing -> {
+                val pct = importPct
+                b.setContentTitle("Lade Datei vom Link …")
+                    .setContentText(status)
+                    .setProgress(100, pct.coerceAtLeast(0), pct < 0)
+            }
+            else -> b.setContentTitle("Aufnahme")
         }
         return b.build()
+    }
+
+    private fun formatElapsed(ms: Long): String {
+        val s = ms / 1000
+        return String.format(java.util.Locale.US, "%02d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
     }
 
     private fun notifyRunning() {
@@ -363,6 +443,8 @@ class RecordingService : Service() {
     }
 
     override fun onDestroy() {
+        val file = recordingFile
+        val duration = elapsedMs()
         recorder?.let {
             try {
                 it.stop()
@@ -373,6 +455,14 @@ class RecordingService : Service() {
         }
         recorder = null
         recordingFile = null
+        pausedAt = 0L
+        pausedTotal = 0L
+        if (file != null && file.length() > 0L) {
+            val rec = Store.get(this, file.name)
+            rec.phase = Rec.PHASE_OPEN
+            rec.durationMs = duration
+            Store.save(this, rec)
+        }
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         worker.shutdown()

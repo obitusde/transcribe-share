@@ -28,10 +28,14 @@ object Prefs {
         p(context).edit().putString("secret", value.trim()).apply()
     }
 
-    fun transcribe(context: Context): Boolean = p(context).getBoolean("transcribe", true)
+    /**
+     * Die Aufnahme, fuer die oben gerade die Entscheidung angezeigt wird
+     * (Transkribieren / lokal behalten / Teilen / Loeschen). Leer = keine.
+     */
+    fun focus(context: Context): String = p(context).getString("focus", null) ?: ""
 
-    fun setTranscribe(context: Context, value: Boolean) {
-        p(context).edit().putBoolean("transcribe", value).apply()
+    fun setFocus(context: Context, name: String) {
+        p(context).edit().putString("focus", name).commit()
     }
 
     fun mail(context: Context): String = p(context).getString("mail", null) ?: MAIL_WORK
@@ -44,7 +48,7 @@ object Prefs {
         val raw = p(context).getString("recent", null) ?: return emptyList()
         return try {
             val a = JSONArray(raw)
-            (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }.take(MAX_RECENT)
+            (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }
         } catch (e: JSONException) {
             emptyList()
         }
@@ -57,7 +61,7 @@ object Prefs {
         p(context).edit().putString("recent", JSONArray(list).toString()).apply()
     }
 
-    /** 0 = unbekannt, 1 = altes Script, 2 = Script mit Kontext/Mailauswahl/TXT. */
+    /** 0 = unbekannt, 1 = altes Script, 2 = Kontext/Mailauswahl/TXT, 3 = Drive-Archiv wird aufgeraeumt. */
     fun serverApi(context: Context): Int = p(context).getInt("serverApi", 0)
 
     fun serverMessage(context: Context): String =
@@ -75,4 +79,11 @@ object Prefs {
     fun usageMonth(context: Context): String = p(context).getString("usageMonth", null) ?: ""
 
     fun usageSeconds(context: Context): Long = p(context).getLong("usageSeconds", 0L)
+
+    /** Tage, nach denen das Script Aufnahmen im Drive-Archiv loescht (0 = unbekannt). */
+    fun archiveDays(context: Context): Int = p(context).getInt("archiveDays", 0)
+
+    fun setArchiveDays(context: Context, days: Int) {
+        p(context).edit().putInt("archiveDays", days).apply()
+    }
 }

@@ -8,6 +8,7 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
@@ -21,19 +22,19 @@ import android.text.InputType
 import android.util.Base64
 import android.view.Gravity
 import android.view.View
-import android.widget.Button
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import androidx.core.content.IntentCompat
+import androidx.core.view.WindowCompat
 import java.io.File
 import java.io.IOException
 import java.security.SecureRandom
@@ -41,32 +42,53 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.Executors
 
+/**
+ * Ablauf:
+ *  1. Oben gibt es nur den Aufnahmeknopf (waehrend der Aufnahme: Pause/Weiter und Stopp).
+ *  2. Nach dem Stopp erscheint oben die Entscheidung fuer genau diese Aufnahme:
+ *     Transkribieren (mit Kontext und Mail), lokal behalten, teilen oder loeschen.
+ *     "Spaeter entscheiden" laesst sie als offen in der Liste stehen.
+ *  3. Unten die Liste: offen, in Arbeit, Transkripte, lokal behaltene Aufnahmen.
+ */
 class MainActivity : Activity() {
 
-    private companion object {
-        const val REQ_PERMISSIONS = 1
-        val URL_PATTERN = Regex("https?://\\S+")
+    companion object {
+        private const val REQ_PERMISSIONS = 1
+        private const val STATUS_SHOW_MS = 20_000L
+        private val URL_PATTERN = Regex("https?://\\S+")
+
+        /** Ob die App gerade im Vordergrund ist (dann keine Entscheidungs-Benachrichtigung). */
+        @Volatile
+        var visible = false
+            private set
     }
 
     /** Was nach erteilter Erlaubnis passieren soll. */
     private var afterPermission: (() -> Unit)? = null
 
-    private lateinit var timerView: TextView
-    private lateinit var recordButton: Button
-    private lateinit var statusView: TextView
-    private lateinit var transcribeSwitch: Switch
-    private lateinit var localHint: TextView
-    private lateinit var optionsBox: LinearLayout
-    private lateinit var contextInput: EditText
-    private lateinit var recentBox: LinearLayout
-    private lateinit var mailGroup: RadioGroup
-    private lateinit var retryButton: Button
+    private lateinit var ui: Ui
+    private lateinit var scroll: ScrollView
+    private lateinit var topBox: LinearLayout
+    private lateinit var bannerBox: LinearLayout
+    private lateinit var bannerText: TextView
+    private lateinit var bannerBar: ProgressBar
+    private lateinit var listBox: LinearLayout
     private lateinit var serverView: TextView
     private lateinit var usageView: TextView
-    private lateinit var listBox: LinearLayout
+    private lateinit var archiveView: TextView
 
-    private val mailIds = mutableMapOf<String, Int>()
+    private var timerView: TextView? = null
+    private var topKey = ""
     private var listSignature = ""
+
+    // Eingaben im Entscheidungsbereich
+    private var contextInput: EditText? = null
+    private var mailGroup: RadioGroup? = null
+    private val mailIds = mutableMapOf<String, Int>()
+
+    @Volatile
+    private var copying = false
+
     private val io = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
@@ -78,134 +100,62 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ui = Ui(this)
         Notifier.ensureChannels(this)
-        Store.cleanup(this)
+        actionBar?.hide()
+        window.statusBarColor = ui.bg
+        window.navigationBarColor = ui.bg
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = !ui.dark
+            isAppearanceLightNavigationBars = !ui.dark
+        }
 
-        val pad = dp(20)
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setPadding(pad, pad, pad, pad)
+        root.setPadding(ui.dp(16), ui.dp(12), ui.dp(16), ui.dp(28))
 
-        timerView = TextView(this)
-        timerView.textSize = 52f
-        timerView.typeface = Typeface.MONOSPACE
-        timerView.gravity = Gravity.CENTER
-        timerView.text = "00:00:00"
-        timerView.setPadding(0, dp(8), 0, dp(16))
+        val header = ui.text("Aufnahme", 26f, ui.text, bold = true)
+        header.setPadding(ui.dp(4), ui.dp(4), 0, ui.dp(12))
+        root.addView(header, ui.full())
 
-        recordButton = Button(this)
-        recordButton.textSize = 22f
-        recordButton.minHeight = dp(88)
-        recordButton.isAllCaps = false
-        recordButton.setOnClickListener { onRecordPressed() }
+        topBox = LinearLayout(this)
+        topBox.orientation = LinearLayout.VERTICAL
+        root.addView(topBox, ui.full())
 
-        statusView = TextView(this)
-        statusView.textSize = 15f
-        statusView.setPadding(0, dp(12), 0, dp(4))
-
-        transcribeSwitch = Switch(this)
-        transcribeSwitch.text = "Transkription (Upload, Mail, TXT)"
-        transcribeSwitch.textSize = 17f
-        transcribeSwitch.setPadding(0, dp(8), 0, dp(8))
-        transcribeSwitch.isChecked = Prefs.transcribe(this)
-        transcribeSwitch.setOnCheckedChangeListener { _, checked ->
-            Prefs.setTranscribe(this, checked)
-            updateOptionsVisibility()
-        }
-
-        localHint = TextView(this)
-        localHint.textSize = 14f
-        localHint.text = "Aus: Die Aufnahme bleibt nur auf dem Handy. In der Liste unten kannst du sie " +
-            "mit \"Teilen\" an andere Apps geben (z. B. Claude, Gemini)."
-
-        contextInput = EditText(this)
-        contextInput.hint = "Kontext (optional), z. B. 1:1 mit Emmy"
-        contextInput.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-        contextInput.isSingleLine = true
-
-        recentBox = LinearLayout(this)
-        recentBox.orientation = LinearLayout.HORIZONTAL
-        val recentScroll = HorizontalScrollView(this)
-        recentScroll.isHorizontalScrollBarEnabled = false
-        recentScroll.addView(recentBox)
-
-        val mailLabel = TextView(this)
-        mailLabel.text = "Mail an:"
-        mailLabel.textSize = 14f
-        mailLabel.setPadding(0, dp(8), 0, 0)
-
-        mailGroup = RadioGroup(this)
-        mailGroup.orientation = RadioGroup.HORIZONTAL
-        for ((key, label) in listOf(
-            Prefs.MAIL_WORK to "Arbeit",
-            Prefs.MAIL_PRIVATE to "Privat",
-            Prefs.MAIL_NONE to "Keine"
-        )) {
-            val rb = RadioButton(this)
-            rb.id = View.generateViewId()
-            rb.text = label
-            rb.setPadding(0, 0, dp(12), 0)
-            mailIds[key] = rb.id
-            mailGroup.addView(rb)
-        }
-        mailGroup.check(mailIds[Prefs.mail(this)] ?: mailIds.getValue(Prefs.MAIL_WORK))
-        mailGroup.setOnCheckedChangeListener { _, _ -> Prefs.setMail(this, selectedMail()) }
-
-        optionsBox = LinearLayout(this)
-        optionsBox.orientation = LinearLayout.VERTICAL
-        optionsBox.addView(contextInput, full())
-        optionsBox.addView(recentScroll, full())
-        optionsBox.addView(mailLabel, full())
-        optionsBox.addView(mailGroup, full())
-
-        retryButton = Button(this)
-        retryButton.text = "Wartende Aufnahmen hochladen"
-        retryButton.isAllCaps = false
-        retryButton.setOnClickListener {
-            withPermissions { launch(RecordingService.intent(this, RecordingService.ACTION_UPLOAD)) }
-        }
+        bannerBox = ui.card(background = ui.accentSoft)
+        bannerText = ui.text("", 14f, ui.text)
+        bannerBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        tint(bannerBar)
+        bannerBox.addView(bannerText, ui.full())
+        bannerBox.addView(bannerBar, ui.margins(ui.full(), t = 8))
+        bannerBox.visibility = View.GONE
+        root.addView(bannerBox, ui.margins(ui.full(), t = 12))
 
         listBox = LinearLayout(this)
         listBox.orientation = LinearLayout.VERTICAL
+        root.addView(listBox, ui.full())
 
-        serverView = TextView(this)
-        serverView.textSize = 13f
-        serverView.setPadding(0, dp(24), 0, dp(4))
+        val footer = LinearLayout(this)
+        footer.orientation = LinearLayout.VERTICAL
+        footer.setPadding(ui.dp(4), ui.dp(28), ui.dp(4), 0)
+        serverView = ui.text("", 13f, ui.sub)
+        usageView = ui.text("", 13f, ui.sub)
+        archiveView = ui.text("", 13f, ui.sub)
+        val versionView = ui.text("Version " + versionName(), 13f, ui.sub)
+        footer.addView(serverView, ui.full())
+        footer.addView(usageView, ui.margins(ui.full(), t = 4))
+        footer.addView(archiveView, ui.margins(ui.full(), t = 4))
+        footer.addView(versionView, ui.margins(ui.full(), t = 4))
+        val keyButton = ui.button("Schlüssel einstellen", Ui.Kind.OUTLINE) { showSecretDialog() }
+        footer.addView(keyButton, ui.margins(ui.wrap(), t = 12))
+        root.addView(footer, ui.full())
 
-        usageView = TextView(this)
-        usageView.textSize = 13f
-        usageView.setPadding(0, 0, 0, dp(4))
-
-        val settingsButton = Button(this, null, android.R.attr.buttonStyleSmall)
-        settingsButton.text = "Schlüssel einstellen"
-        settingsButton.isAllCaps = false
-        settingsButton.setOnClickListener { showSecretDialog() }
-
-        root.addView(timerView, full())
-        root.addView(recordButton, full())
-        root.addView(statusView, full())
-        root.addView(sectionTitle("Nächste Aufnahme"), full())
-        root.addView(transcribeSwitch, full())
-        root.addView(localHint, full())
-        root.addView(optionsBox, full())
-        root.addView(retryButton, full())
-        root.addView(sectionTitle("Aufnahmen (nach dem Upload ${Store.KEEP_DAYS} Tage auf dem Handy)"), full())
-        root.addView(listBox, full())
-        root.addView(serverView, full())
-        root.addView(usageView, full())
-        root.addView(settingsButton, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-
-        val scroll = ScrollView(this)
+        scroll = ScrollView(this)
         scroll.fitsSystemWindows = true
+        scroll.setBackgroundColor(ui.bg)
         scroll.addView(root)
         setContentView(scroll)
 
-        loadActiveOptions()
-        rebuildRecent()
-        updateOptionsVisibility()
         if (savedInstanceState == null) handleShare(intent)
     }
 
@@ -216,14 +166,24 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        visible = true
+        val focus = Prefs.focus(this)
+        if (focus.isNotEmpty()) Notifier.cancelDecide(this, focus)
+        topKey = ""
+        listSignature = ""
         handler.post(refresh)
         checkServer()
-        if (Store.awaitingStatus(this).isNotEmpty()) StatusWorker.schedule(this, 0)
+        val app = applicationContext
+        io.execute {
+            Store.cleanup(app)
+            Store.fillMeta(app)
+            if (Store.awaitingStatus(app).isNotEmpty()) StatusWorker.schedule(app, 0)
+        }
     }
 
     override fun onPause() {
+        visible = false
         handler.removeCallbacks(refresh)
-        saveActiveOptions()
         super.onPause()
     }
 
@@ -232,62 +192,637 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    // --- Aufnahme -------------------------------------------------------
+    // --- Anzeige ----------------------------------------------------------
 
-    private fun onRecordPressed() {
-        if (RecordingService.isRecording()) {
-            saveActiveOptions()
-            startService(RecordingService.intent(this, RecordingService.ACTION_STOP))
-            if (transcribeSwitch.isChecked) Prefs.addRecentContext(this, contextInput.text.toString())
-            contextInput.setText("")
-            timerView.text = "00:00:00"
-            rebuildRecent()
-            return
+    private fun render() {
+        val recording = RecordingService.isRecording()
+        val paused = RecordingService.isPaused()
+        val focus = focusRec()
+        val key = when {
+            recording -> "rec:$paused"
+            focus != null -> "decide:${focus.name}:${focus.phase}"
+            else -> "idle"
         }
-        withPermissions { launchStart() }
+        if (key != topKey) {
+            topKey = key
+            topBox.removeAllViews()
+            contextInput = null
+            mailGroup = null
+            timerView = null
+            topBox.addView(
+                if (focus != null && !recording) decisionCard(focus) else recorderCard(recording, paused),
+                ui.full()
+            )
+        }
+        timerView?.text = formatElapsed(RecordingService.elapsedMs())
+
+        renderBanner()
+        renderList(focus)
+
+        serverView.text = "Server: " + Prefs.serverMessage(this)
+        usageView.text = usageText()
+        usageView.visibility = if (usageView.text.isEmpty()) View.GONE else View.VISIBLE
+        archiveView.text = archiveText()
+        archiveView.visibility = if (archiveView.text.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    /** Die Aufnahme, fuer die oben entschieden wird - oder null. */
+    private fun focusRec(): Rec? {
+        val name = Prefs.focus(this)
+        if (name.isEmpty()) return null
+        val rec = Store.get(this, name)
+        val ok = (rec.phase == Rec.PHASE_OPEN || rec.phase == Rec.PHASE_LOCAL) && Store.hasAudio(this, rec)
+        if (!ok) {
+            Prefs.setFocus(this, "")
+            return null
+        }
+        return rec
+    }
+
+    private fun renderBanner() {
+        val status = RecordingService.status
+        val fresh = status.isNotEmpty() && SystemClock.elapsedRealtime() - RecordingService.statusAt < STATUS_SHOW_MS
+        val importing = RecordingService.importing
+        val show = importing || copying || fresh
+        bannerBox.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        bannerText.text = when {
+            status.isNotEmpty() -> status
+            copying -> "Übernehme Datei …"
+            else -> "Lade Datei vom Link …"
+        }
+        val busy = importing || copying
+        bannerBar.visibility = if (busy) View.VISIBLE else View.GONE
+        val pct = RecordingService.importPct
+        bannerBar.isIndeterminate = !importing || pct < 0
+        if (!bannerBar.isIndeterminate) bannerBar.progress = pct
+    }
+
+    // --- Oben: Aufnahme ------------------------------------------------------
+
+    private fun recorderCard(recording: Boolean, paused: Boolean): View {
+        val c = ui.card()
+        c.setPadding(ui.dp(18), ui.dp(18), ui.dp(18), ui.dp(18))
+
+        val badge = when {
+            paused -> ui.badge("❚❚  Pausiert", ui.orange, ui.orangeSoft)
+            recording -> ui.badge("●  Aufnahme läuft", ui.red, ui.redSoft)
+            else -> ui.badge("Bereit", ui.sub, ui.greySoft)
+        }
+        val badgeParams = ui.wrap()
+        badgeParams.gravity = Gravity.CENTER_HORIZONTAL
+        c.addView(badge, badgeParams)
+
+        val timer = ui.text("00:00:00", 54f, when {
+            paused -> ui.orange
+            recording -> ui.red
+            else -> ui.sub
+        })
+        timer.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        timer.gravity = Gravity.CENTER
+        timer.setPadding(0, ui.dp(6), 0, ui.dp(14))
+        timerView = timer
+        c.addView(timer, ui.full())
+
+        if (!recording) {
+            c.addView(ui.button("●   Aufnahme starten", Ui.Kind.RECORD, big = true) {
+                withPermissions { launchStart() }
+            }, ui.full())
+            c.addView(hint("Danach entscheidest du: transkribieren, nur lokal behalten oder teilen."), ui.margins(ui.full(), t = 12))
+        } else {
+            val pause = if (paused) {
+                ui.button("▶  Weiter", Ui.Kind.RECORD, big = true) { serviceAction(RecordingService.ACTION_RESUME) }
+            } else {
+                ui.button("❚❚  Pause", Ui.Kind.TONAL, big = true) { serviceAction(RecordingService.ACTION_PAUSE) }
+            }
+            val stop = ui.button("■  Stopp", Ui.Kind.PRIMARY, big = true) { serviceAction(RecordingService.ACTION_STOP) }
+            c.addView(ui.row(pause, stop), ui.full())
+            c.addView(
+                hint("Der Bildschirm darf aus. Pause und Stopp gehen auch über die Benachrichtigung."),
+                ui.margins(ui.full(), t = 12)
+            )
+        }
+        return c
+    }
+
+    private fun hint(s: String): TextView {
+        val t = ui.text(s, 13f, ui.sub)
+        t.gravity = Gravity.CENTER
+        return t
     }
 
     private fun launchStart() {
-        timerView.text = "00:00:00"
-        RecordingService.status = ""
-        val i = RecordingService.intent(this, RecordingService.ACTION_START)
-        i.putExtra(RecordingService.EXTRA_MODE, currentMode())
-        i.putExtra(RecordingService.EXTRA_CONTEXT, contextInput.text.toString().trim())
-        i.putExtra(RecordingService.EXTRA_MAIL, selectedMail())
-        launch(i)
+        RecordingService.report("")
+        launch(RecordingService.intent(this, RecordingService.ACTION_START))
+    }
+
+    private fun serviceAction(action: String) {
+        try {
+            startService(RecordingService.intent(this, action))
+        } catch (e: Exception) {
+            RecordingService.report("Ging nicht: " + Store.describe(e))
+        }
     }
 
     private fun launch(i: Intent) {
         try {
             startForegroundService(i)
         } catch (e: Exception) {
-            RecordingService.status = "Dienst konnte nicht starten. " + Store.describe(e)
+            RecordingService.report("Dienst konnte nicht starten. " + Store.describe(e))
         }
     }
 
-    private fun currentMode(): String =
-        if (transcribeSwitch.isChecked) Rec.MODE_TRANSCRIBE else Rec.MODE_LOCAL
+    // --- Oben: Entscheidung -------------------------------------------------
 
-    private fun selectedMail(): String =
-        mailIds.entries.firstOrNull { it.value == mailGroup.checkedRadioButtonId }?.key ?: Prefs.MAIL_WORK
+    private fun decisionCard(rec: Rec): View {
+        val isLocal = rec.phase == Rec.PHASE_LOCAL
+        val c = ui.card(stripe = if (isLocal) ui.grey else ui.orange)
 
-    /** Was in der App eingestellt ist, gilt fuer die laufende Aufnahme - auch beim Stopp ueber die Benachrichtigung. */
-    private fun saveActiveOptions() {
-        val f = RecordingService.recordingFile ?: return
-        val rec = Store.get(this, f.name)
-        rec.mode = currentMode()
-        rec.context = contextInput.text.toString().trim()
-        rec.mail = selectedMail()
-        Store.save(this, rec)
+        val badge = if (isLocal) ui.badge("Lokal behalten", ui.grey, ui.greySoft)
+        else ui.badge("⚠  Noch nicht entschieden", ui.orange, ui.orangeSoft)
+        c.addView(badge, ui.wrap())
+
+        c.addView(
+            ui.text(if (isLocal) "Was soll mit der Aufnahme passieren?" else "Aufnahme gespeichert – was soll damit passieren?", 19f, ui.text, bold = true),
+            ui.margins(ui.full(), t = 10)
+        )
+        addIdentity(c, rec)
+
+        val listen = ui.button("▶  Anhören", Ui.Kind.TONAL) { openAudio(rec) }
+        c.addView(listen, ui.margins(ui.wrap(), t = 10))
+
+        c.addView(divider(), ui.margins(ui.full(), t = 16, b = 14))
+
+        c.addView(ui.text("Transkribieren", 17f, ui.text, bold = true), ui.full())
+        val days = Prefs.archiveDays(this)
+        c.addView(
+            ui.text(
+                "Upload zu Google Drive → AssemblyAI → Mail und TXT. Sobald das TXT auf dem Handy ist, " +
+                    "wird die Aufnahme hier gelöscht" + (if (days > 0) ", in Drive nach $days Tagen." else "."),
+                13f, ui.sub
+            ),
+            ui.margins(ui.full(), t = 2, b = 10)
+        )
+
+        val input = EditText(this)
+        input.hint = "Kontext (optional), z. B. 1:1 mit Emmy"
+        input.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        input.isSingleLine = true
+        input.imeOptions = EditorInfo.IME_ACTION_DONE
+        input.setTextColor(ui.text)
+        input.setHintTextColor(ui.sub)
+        input.textSize = 16f
+        input.background = ui.rounded(ui.field, 12, ui.line)
+        input.setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(12))
+        input.setText(rec.context)
+        contextInput = input
+        c.addView(input, ui.full())
+
+        val recent = Prefs.recentContexts(this)
+        if (recent.isNotEmpty()) {
+            val chips = FlowLayout(this, ui.dp(8))
+            for (ctx in recent) {
+                val chip = ui.button(ctx, Ui.Kind.OUTLINE) {
+                    input.setText(ctx)
+                    input.setSelection(ctx.length)
+                }
+                chip.textSize = 14f
+                chip.setTypeface(Typeface.DEFAULT, Typeface.NORMAL)
+                chip.minHeight = ui.dp(38)
+                chip.minimumHeight = ui.dp(38)
+                chip.setPadding(ui.dp(14), 0, ui.dp(14), 0)
+                chips.addView(chip)
+            }
+            c.addView(ui.text("Zuletzt verwendet:", 13f, ui.sub), ui.margins(ui.full(), t = 10, b = 6))
+            c.addView(chips, ui.full())
+        }
+
+        c.addView(ui.text("Mail an:", 13f, ui.sub), ui.margins(ui.full(), t = 12))
+        val group = RadioGroup(this)
+        group.orientation = RadioGroup.HORIZONTAL
+        mailIds.clear()
+        for ((key, label) in listOf(
+            Prefs.MAIL_WORK to "Arbeit",
+            Prefs.MAIL_PRIVATE to "Privat",
+            Prefs.MAIL_NONE to "Keine"
+        )) {
+            val rb = RadioButton(this)
+            rb.id = View.generateViewId()
+            rb.text = label
+            rb.textSize = 16f
+            rb.setTextColor(ui.text)
+            rb.buttonTintList = ColorStateList.valueOf(ui.accent)
+            rb.setPadding(0, 0, ui.dp(14), 0)
+            mailIds[key] = rb.id
+            group.addView(rb)
+        }
+        group.check(mailIds[Prefs.mail(this)] ?: mailIds.getValue(Prefs.MAIL_WORK))
+        mailGroup = group
+        c.addView(group, ui.full())
+
+        c.addView(ui.button("Transkribieren", Ui.Kind.PRIMARY, big = true) { decideTranscribe(rec) }, ui.margins(ui.full(), t = 12))
+
+        c.addView(divider(), ui.margins(ui.full(), t = 18, b = 14))
+        c.addView(ui.text("Oder ohne Transkription", 17f, ui.text, bold = true), ui.full())
+        c.addView(
+            ui.text("Die Aufnahme bleibt nur auf dem Handy. Mit Teilen gibst du sie z. B. an Claude oder Gemini.", 13f, ui.sub),
+            ui.margins(ui.full(), t = 2, b = 10)
+        )
+        val keep = ui.button("Lokal behalten", Ui.Kind.TONAL) { decideLocal(rec, shared = false) }
+        val share = ui.button("Teilen …", Ui.Kind.TONAL) {
+            shareFile(Store.audioFile(this, rec.name), Store.mimeFor(Store.audioFile(this, rec.name)), "Aufnahme teilen")
+            decideLocal(rec, shared = true)
+        }
+        if (isLocal) {
+            c.addView(ui.row(share), ui.full())
+        } else {
+            c.addView(ui.row(keep, share), ui.full())
+        }
+        val delete = ui.button("Löschen", Ui.Kind.DANGER) { confirmDelete(rec) }
+        val later = ui.button(if (isLocal) "Abbrechen" else "Später entscheiden", Ui.Kind.OUTLINE) { closeFocus(rec) }
+        c.addView(ui.row(delete, later), ui.margins(ui.full(), t = 10))
+        return c
     }
 
-    private fun loadActiveOptions() {
-        val f = RecordingService.recordingFile ?: return
-        val rec = Store.get(this, f.name)
-        transcribeSwitch.isChecked = rec.mode == Rec.MODE_TRANSCRIBE
-        contextInput.setText(rec.context)
-        mailIds[rec.mail]?.let { mailGroup.check(it) }
+    private fun divider(): View {
+        val v = View(this)
+        v.setBackgroundColor(ui.line)
+        v.minimumHeight = ui.dp(1)
+        return v
     }
+
+    private fun selectedMail(): String {
+        val g = mailGroup ?: return Prefs.mail(this)
+        return mailIds.entries.firstOrNull { it.value == g.checkedRadioButtonId }?.key ?: Prefs.MAIL_WORK
+    }
+
+    private fun decideTranscribe(rec: Rec) {
+        val ctx = contextInput?.text?.toString()?.trim() ?: rec.context
+        val mail = selectedMail()
+        val r = Store.get(this, rec.name)
+        r.mode = Rec.MODE_TRANSCRIBE
+        r.context = ctx
+        r.mail = mail
+        r.phase = Rec.PHASE_NEW
+        r.note = ""
+        r.progress = -1
+        Store.save(this, r)
+        Prefs.setMail(this, mail)
+        Prefs.addRecentContext(this, ctx)
+        closeFocus(r)
+        withPermissions { launch(RecordingService.intent(this, RecordingService.ACTION_UPLOAD)) }
+    }
+
+    private fun decideLocal(rec: Rec, shared: Boolean) {
+        val r = Store.get(this, rec.name)
+        r.mode = Rec.MODE_LOCAL
+        r.phase = Rec.PHASE_LOCAL
+        if (shared) r.shared = true
+        Store.save(this, r)
+        closeFocus(r)
+    }
+
+    /** Entscheidungsbereich schliessen: oben wieder nur der Aufnahmeknopf. */
+    private fun closeFocus(rec: Rec) {
+        Prefs.setFocus(this, "")
+        Notifier.cancelDecide(this, rec.name)
+        hideKeyboard()
+        topKey = ""
+        listSignature = ""
+        render()
+    }
+
+    private fun openFocus(rec: Rec) {
+        Prefs.setFocus(this, rec.name)
+        topKey = ""
+        listSignature = ""
+        render()
+        scroll.post { scroll.smoothScrollTo(0, 0) }
+    }
+
+    private fun hideKeyboard() {
+        val v = currentFocus ?: return
+        getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(v.windowToken, 0)
+        v.clearFocus()
+    }
+
+    // --- Unten: Liste ---------------------------------------------------------
+
+    private fun renderList(focus: Rec?) {
+        val active = RecordingService.recordingFile?.name
+        val recs = Store.entries(this).filter { it.name != focus?.name && it.name != active }
+        val sig = buildString {
+            append(RecordingService.busy).append(Prefs.serverApi(this@MainActivity)).append(Prefs.archiveDays(this@MainActivity))
+            for (r in recs) {
+                append('|').append(r.name).append(r.phase).append(r.note).append(r.hasTxt).append(r.shared)
+                append(r.context).append(r.progress).append(Store.since(r)).append(r.durationMs)
+                append(r.title).append(Store.hasAudio(this@MainActivity, r))
+            }
+        }
+        if (sig == listSignature) return
+        listSignature = sig
+
+        listBox.removeAllViews()
+        val open = recs.filter { it.phase == Rec.PHASE_OPEN }
+        val working = recs.filter {
+            it.phase in setOf(Rec.PHASE_NEW, Rec.PHASE_UPLOADING, Rec.PHASE_UPLOAD_FAILED, Rec.PHASE_TRANSCRIBING, Rec.PHASE_FAILED)
+        }
+        val done = recs.filter { it.phase == Rec.PHASE_DONE }
+        val local = recs.filter { it.phase == Rec.PHASE_LOCAL }
+
+        if (recs.isEmpty()) {
+            listBox.addView(section("Noch keine Aufnahmen", ui.sub), ui.full())
+            return
+        }
+        if (open.isNotEmpty()) {
+            listBox.addView(section("⚠  Noch nicht entschieden (${open.size})", ui.orange), ui.full())
+            open.forEach { addItem(openItem(it)) }
+        }
+        if (working.isNotEmpty()) {
+            listBox.addView(section("In Arbeit (${working.size})", ui.accent), ui.full())
+            working.forEach { addItem(workItem(it)) }
+        }
+        if (done.isNotEmpty()) {
+            listBox.addView(section("Transkripte (${done.size})", ui.green), ui.full())
+            done.forEach { addItem(doneItem(it)) }
+        }
+        if (local.isNotEmpty()) {
+            listBox.addView(section("Lokal behaltene Aufnahmen (${local.size})", ui.grey), ui.full())
+            local.forEach { addItem(localItem(it)) }
+        }
+    }
+
+    private fun addItem(v: View) {
+        listBox.addView(v, ui.margins(ui.full(), b = 10))
+    }
+
+    private fun section(s: String, color: Int): TextView {
+        val t = ui.text(s, 15f, color, bold = true)
+        t.setPadding(ui.dp(4), ui.dp(22), 0, ui.dp(8))
+        return t
+    }
+
+    /** Datum/Uhrzeit gross, darunter Titel (bei uebernommenen Dateien) und Dauer/Groesse. */
+    private fun addIdentity(box: LinearLayout, r: Rec) {
+        box.addView(ui.text(Store.whenText(r), 16f, ui.text, bold = true), ui.margins(ui.full(), t = 6))
+        if (r.title.isNotBlank()) box.addView(ui.text(r.title, 14f, ui.text), ui.margins(ui.full(), t = 2))
+        val size = if (Store.hasAudio(this, r)) Store.sizeLine(this, r) else Store.durationText(r.durationMs)
+        if (size.isNotEmpty()) box.addView(ui.text(size, 13f, ui.sub), ui.margins(ui.full(), t = 2))
+    }
+
+    private fun statusLine(box: LinearLayout, s: String, color: Int) {
+        box.addView(ui.text(s, 14f, color, bold = true), ui.margins(ui.full(), t = 8))
+    }
+
+    private fun contextLine(box: LinearLayout, r: Rec) {
+        if (r.context.isNotBlank()) box.addView(ui.text("Kontext: " + r.context, 14f, ui.sub), ui.margins(ui.full(), t = 2))
+    }
+
+    private fun buttons(box: LinearLayout, vararg items: Pair<String, Pair<Ui.Kind, () -> Unit>>) {
+        if (items.isEmpty()) return
+        val flow = FlowLayout(this, ui.dp(8))
+        for ((label, spec) in items) {
+            val b = ui.button(label, spec.first, onClick = spec.second)
+            b.textSize = 14f
+            b.minHeight = ui.dp(40)
+            b.minimumHeight = ui.dp(40)
+            b.setPadding(ui.dp(14), 0, ui.dp(14), 0)
+            flow.addView(b)
+        }
+        box.addView(flow, ui.margins(ui.full(), t = 10))
+    }
+
+    private fun progress(box: LinearLayout, pct: Int) {
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        tint(bar)
+        bar.max = 100
+        bar.isIndeterminate = pct < 0
+        if (pct >= 0) bar.progress = pct
+        box.addView(bar, ui.margins(ui.full(), t = 6))
+    }
+
+    private fun tint(bar: ProgressBar) {
+        bar.progressTintList = ColorStateList.valueOf(ui.accent)
+        bar.indeterminateTintList = ColorStateList.valueOf(ui.accent)
+        bar.progressBackgroundTintList = ColorStateList.valueOf(ui.line)
+    }
+
+    private fun openItem(r: Rec): View {
+        val c = ui.card(stripe = ui.orange)
+        c.addView(ui.badge("⚠  Noch nicht entschieden", ui.orange, ui.orangeSoft), ui.wrap())
+        addIdentity(c, r)
+        buttons(
+            c,
+            "Entscheiden" to (Ui.Kind.PRIMARY to { openFocus(r) }),
+            "▶ Anhören" to (Ui.Kind.TONAL to { openAudio(r) }),
+            "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
+        )
+        return c
+    }
+
+    private fun workItem(r: Rec): View {
+        val failed = r.phase == Rec.PHASE_UPLOAD_FAILED || r.phase == Rec.PHASE_FAILED
+        val c = ui.card(stripe = if (failed) ui.red else ui.accent)
+        addIdentity(c, r)
+        when (r.phase) {
+            Rec.PHASE_NEW -> {
+                statusLine(c, "Wartet auf den Upload", ui.accent)
+                contextLine(c, r)
+                if (!RecordingService.busy) {
+                    buttons(c, "Jetzt hochladen" to (Ui.Kind.PRIMARY to { upload() }))
+                }
+            }
+            Rec.PHASE_UPLOADING -> {
+                statusLine(c, r.note.ifEmpty { "Wird hochgeladen …" }, ui.accent)
+                progress(c, r.progress)
+                contextLine(c, r)
+            }
+            Rec.PHASE_TRANSCRIBING -> {
+                statusLine(c, "⏳ " + r.note.ifEmpty { "Transkription läuft …" } + Store.since(r), ui.accent)
+                progress(c, -1)
+                c.addView(ui.text("Danach: " + Store.mailDone(r) + " · TXT aufs Handy", 13f, ui.sub), ui.margins(ui.full(), t = 4))
+                contextLine(c, r)
+            }
+            Rec.PHASE_UPLOAD_FAILED -> {
+                statusLine(c, "✘ Upload fehlgeschlagen", ui.red)
+                if (r.note.isNotBlank()) c.addView(ui.text(r.note, 13f, ui.sub), ui.margins(ui.full(), t = 2))
+                contextLine(c, r)
+                buttons(
+                    c,
+                    "Erneut hochladen" to (Ui.Kind.PRIMARY to { upload() }),
+                    "Lokal behalten" to (Ui.Kind.TONAL to { decideLocal(r, shared = false) }),
+                    "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
+                )
+            }
+            else -> {
+                statusLine(c, "✘ " + r.note.ifEmpty { "Transkription fehlgeschlagen." }, ui.red)
+                contextLine(c, r)
+                val items = mutableListOf<Pair<String, Pair<Ui.Kind, () -> Unit>>>()
+                if (Store.hasAudio(this, r)) {
+                    items += "Teilen" to (Ui.Kind.TONAL to { shareAudio(r) })
+                    items += "Lokal behalten" to (Ui.Kind.TONAL to { decideLocal(r, shared = false) })
+                }
+                items += "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
+                buttons(c, *items.toTypedArray())
+            }
+        }
+        return c
+    }
+
+    private fun doneItem(r: Rec): View {
+        val c = ui.card(stripe = ui.green)
+        addIdentity(c, r)
+        statusLine(c, "✔ Transkribiert · " + Store.mailDone(r), ui.green)
+        val hasTxt = Store.hasTxt(this, r)
+        val audio = Store.hasAudio(this, r)
+        val info = when {
+            hasTxt && !audio -> "TXT auf dem Handy · Aufnahme gelöscht"
+            hasTxt -> "TXT auf dem Handy"
+            Store.needsStatus(this, r) -> "TXT wird geholt …"
+            else -> "Kein TXT auf dem Handy (nur per Mail)"
+        }
+        c.addView(ui.text(info, 13f, ui.sub), ui.margins(ui.full(), t = 2))
+        contextLine(c, r)
+        val items = mutableListOf<Pair<String, Pair<Ui.Kind, () -> Unit>>>()
+        if (hasTxt) {
+            items += "Lesen" to (Ui.Kind.PRIMARY to { showTranscript(r) })
+            items += "TXT teilen" to (Ui.Kind.TONAL to { shareTxt(r) })
+            items += "TXT speichern" to (Ui.Kind.TONAL to { saveToDownloads(Store.txtFile(this, r.name)) })
+        }
+        if (audio) items += "Audio teilen" to (Ui.Kind.OUTLINE to { shareAudio(r) })
+        items += "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
+        buttons(c, *items.toTypedArray())
+        return c
+    }
+
+    private fun localItem(r: Rec): View {
+        val c = ui.card(stripe = ui.grey)
+        addIdentity(c, r)
+        statusLine(c, "✔ Lokal behalten" + (if (r.shared) " · geteilt" else ""), ui.grey)
+        contextLine(c, r)
+        buttons(
+            c,
+            "▶ Anhören" to (Ui.Kind.TONAL to { openAudio(r) }),
+            "Teilen" to (Ui.Kind.TONAL to { shareAudio(r) }),
+            "Transkribieren" to (Ui.Kind.OUTLINE to { openFocus(r) }),
+            "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
+        )
+        return c
+    }
+
+    // --- Aktionen ---------------------------------------------------------------
+
+    private fun upload() {
+        listSignature = ""
+        withPermissions { launch(RecordingService.intent(this, RecordingService.ACTION_UPLOAD)) }
+    }
+
+    private fun shareAudio(r: Rec) {
+        val f = Store.audioFile(this, r.name)
+        shareFile(f, Store.mimeFor(f), "Aufnahme teilen")
+        val fresh = Store.get(this, r.name)
+        if (fresh.phase == Rec.PHASE_LOCAL && !fresh.shared) {
+            fresh.shared = true
+            Store.save(this, fresh)
+        }
+    }
+
+    private fun shareTxt(r: Rec) {
+        shareFile(Store.txtFile(this, r.name), "text/plain", "Transkript teilen")
+    }
+
+    private fun shareFile(f: File, mime: String, title: String) {
+        try {
+            val uri = FileProvider.getUriForFile(this, "$packageName.files", f)
+            val send = Intent(Intent.ACTION_SEND)
+            send.type = mime
+            send.putExtra(Intent.EXTRA_STREAM, uri)
+            send.clipData = ClipData.newRawUri(f.name, uri)
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(send, title))
+        } catch (e: Exception) {
+            toast("Teilen fehlgeschlagen: " + Store.describe(e))
+        }
+    }
+
+    private fun openAudio(r: Rec) {
+        try {
+            val f = Store.audioFile(this, r.name)
+            val uri = FileProvider.getUriForFile(this, "$packageName.files", f)
+            val view = Intent(Intent.ACTION_VIEW)
+            view.setDataAndType(uri, Store.mimeFor(f))
+            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(view)
+        } catch (e: Exception) {
+            toast("Keine App zum Abspielen gefunden.")
+        }
+    }
+
+    private fun showTranscript(r: Rec) {
+        val text = try {
+            Store.txtFile(this, r.name).readText()
+        } catch (e: Exception) {
+            toast("Transkript nicht lesbar: " + Store.describe(e))
+            return
+        }
+        val t = TextView(this)
+        t.text = text
+        t.textSize = 15f
+        t.setTextIsSelectable(true)
+        t.setLineSpacing(0f, 1.2f)
+        t.setPadding(ui.dp(22), ui.dp(8), ui.dp(22), ui.dp(8))
+        val sv = ScrollView(this)
+        sv.addView(t)
+        AlertDialog.Builder(this)
+            .setTitle(Store.whenText(r))
+            .setView(sv)
+            .setPositiveButton("Teilen") { _, _ -> shareTxt(r) }
+            .setNegativeButton("Schließen", null)
+            .show()
+    }
+
+    private fun saveToDownloads(txt: File) {
+        try {
+            val values = ContentValues()
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, txt.name)
+            values.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Transkripte")
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("Android hat keinen Speicherplatz bereitgestellt.")
+            val out = contentResolver.openOutputStream(uri)
+                ?: throw IOException("Datei konnte nicht geöffnet werden.")
+            out.use { o -> txt.inputStream().use { it.copyTo(o) } }
+            toast("Gespeichert unter Download/Transkripte/${txt.name}")
+        } catch (e: Exception) {
+            toast("Speichern fehlgeschlagen: " + Store.describe(e))
+        }
+    }
+
+    private fun confirmDelete(r: Rec) {
+        val days = Prefs.archiveDays(this)
+        val message = when (r.phase) {
+            Rec.PHASE_DONE ->
+                "Transkript und Eintrag werden vom Handy gelöscht. In Google Drive bleibt das TXT" +
+                    (if (days > 0) "; die Aufnahme dort wird $days Tage nach dem Upload gelöscht." else ".")
+            Rec.PHASE_TRANSCRIBING, Rec.PHASE_FAILED ->
+                "Die Aufnahme wird vom Handy gelöscht. Die Kopie in Google Drive wird trotzdem fertig verarbeitet."
+            else -> "Die Aufnahme wird endgültig vom Handy gelöscht. Sie war nie in Google Drive."
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Löschen?")
+            .setMessage(Store.whenText(r) + "\n\n" + message)
+            .setPositiveButton("Löschen") { _, _ ->
+                Store.deleteRecording(this, r.name)
+                Notifier.cancelDecide(this, r.name)
+                topKey = ""
+                listSignature = ""
+                render()
+            }
+            .setNegativeButton("Abbrechen", null)
+            .show()
+    }
+
+    // --- Erlaubnisse ------------------------------------------------------------
 
     /**
      * Der Vordergrund-Dienst hat den Typ "microphone" und braucht deshalb die
@@ -310,211 +845,19 @@ class MainActivity : Activity() {
         val action = afterPermission
         afterPermission = null
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            RecordingService.status = "Ohne Mikrofon-Erlaubnis kann die App nicht aufnehmen."
+            RecordingService.report("Ohne Mikrofon-Erlaubnis kann die App nicht aufnehmen.")
             return
         }
         action?.invoke()
     }
 
-    // --- Anzeige ----------------------------------------------------------
-
-    private fun render() {
-        val recording = RecordingService.isRecording()
-        recordButton.text = when {
-            !recording -> "●  Aufnahme starten"
-            transcribeSwitch.isChecked -> "■  Stopp & hochladen"
-            else -> "■  Stopp"
-        }
-        timerView.text = if (recording) {
-            formatElapsed(SystemClock.elapsedRealtime() - RecordingService.startedAt)
-        } else {
-            "00:00:00"
-        }
-        statusView.text = RecordingService.status.ifEmpty { "Bereit. Nach dem Start darf der Bildschirm aus." }
-        retryButton.visibility =
-            if (Store.pending(this).isNotEmpty() && !RecordingService.busy) View.VISIBLE else View.GONE
-        serverView.text = "Server: " + Prefs.serverMessage(this)
-        usageView.text = usageText()
-        usageView.visibility = if (usageView.text.isEmpty()) View.GONE else View.VISIBLE
-        renderList()
-    }
-
-    private fun updateOptionsVisibility() {
-        val on = transcribeSwitch.isChecked
-        optionsBox.visibility = if (on) View.VISIBLE else View.GONE
-        localHint.visibility = if (on) View.GONE else View.VISIBLE
-    }
-
-    private fun rebuildRecent() {
-        recentBox.removeAllViews()
-        for (ctx in Prefs.recentContexts(this)) {
-            val b = Button(this, null, android.R.attr.buttonStyleSmall)
-            b.text = ctx
-            b.isAllCaps = false
-            b.setOnClickListener {
-                contextInput.setText(ctx)
-                contextInput.setSelection(ctx.length)
-            }
-            recentBox.addView(b)
-        }
-    }
-
-    private fun renderList() {
-        val active = RecordingService.recordingFile
-        val files = Store.all(this).take(20)
-        val recs = files.map { Store.get(this, it.name) }
-        val sig = buildString {
-            append(active?.name).append(RecordingService.busy)
-            for (r in recs) {
-                append('|').append(r.name).append(r.phase).append(r.note).append(r.hasTxt)
-                append(r.context).append(r.progress).append(Store.since(r))
-            }
-        }
-        if (sig == listSignature) return
-        listSignature = sig
-
-        listBox.removeAllViews()
-        if (files.isEmpty()) {
-            val empty = TextView(this)
-            empty.text = "Noch keine Aufnahmen."
-            listBox.addView(empty)
-            return
-        }
-        for (i in files.indices) listBox.addView(itemView(files[i], recs[i], files[i] == active), full())
-    }
-
-    private fun itemView(f: File, rec: Rec, isActive: Boolean): View {
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        box.setPadding(0, dp(10), 0, dp(10))
-
-        val title = TextView(this)
-        title.text = if (rec.title.isNotBlank()) {
-            "${rec.title}  (${Store.sizeText(f)})\n${f.name}"
-        } else {
-            "${f.name}  (${Store.sizeText(f)})"
-        }
-        title.setTypeface(title.typeface, Typeface.BOLD)
-        box.addView(title)
-
-        val details = TextView(this)
-        details.text = Store.details(rec, isActive)
-        box.addView(details)
-
-        if (rec.phase == Rec.PHASE_UPLOADING || rec.phase == Rec.PHASE_TRANSCRIBING) {
-            val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
-            bar.max = 100
-            // AssemblyAI meldet keinen Prozentwert: waehrend der Transkription laeuft der Balken nur.
-            bar.isIndeterminate = rec.phase == Rec.PHASE_TRANSCRIBING || rec.progress < 0
-            if (!bar.isIndeterminate) bar.progress = rec.progress
-            box.addView(bar, full())
-        }
-
-        if (!isActive) {
-            val row = LinearLayout(this)
-            row.orientation = LinearLayout.HORIZONTAL
-            fun add(label: String, action: () -> Unit) {
-                val b = Button(this, null, android.R.attr.buttonStyleSmall)
-                b.text = label
-                b.isAllCaps = false
-                b.setOnClickListener { action() }
-                row.addView(b)
-            }
-            add("Teilen") { shareFile(f, Store.mimeFor(f), "Aufnahme teilen") }
-            val txt = Store.txtFile(this, rec.name)
-            if (rec.hasTxt && txt.exists()) {
-                add("TXT teilen") { shareFile(txt, "text/plain", "Transkript teilen") }
-                add("TXT speichern") { saveToDownloads(txt) }
-            }
-            if (rec.phase == Rec.PHASE_LOCAL) add("Transkribieren") { confirmTranscribe(rec) }
-            if (rec.phase != Rec.PHASE_UPLOADING) add("Löschen") { confirmDelete(f) }
-            val rowScroll = HorizontalScrollView(this)
-            rowScroll.isHorizontalScrollBarEnabled = false
-            rowScroll.addView(row)
-            box.addView(rowScroll)
-        }
-        return box
-    }
-
-    // --- Aktionen in der Liste ---------------------------------------------
-
-    private fun shareFile(f: File, mime: String, title: String) {
-        try {
-            val uri = FileProvider.getUriForFile(this, "$packageName.files", f)
-            val send = Intent(Intent.ACTION_SEND)
-            send.type = mime
-            send.putExtra(Intent.EXTRA_STREAM, uri)
-            send.clipData = ClipData.newRawUri(f.name, uri)
-            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            startActivity(Intent.createChooser(send, title))
-        } catch (e: Exception) {
-            toast("Teilen fehlgeschlagen: " + Store.describe(e))
-        }
-    }
-
-    private fun saveToDownloads(txt: File) {
-        try {
-            val values = ContentValues()
-            values.put(MediaStore.MediaColumns.DISPLAY_NAME, txt.name)
-            values.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Transkripte")
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: throw IOException("Android hat keinen Speicherplatz bereitgestellt.")
-            val out = contentResolver.openOutputStream(uri)
-                ?: throw IOException("Datei konnte nicht geöffnet werden.")
-            out.use { o -> txt.inputStream().use { it.copyTo(o) } }
-            toast("Gespeichert unter Download/Transkripte/${txt.name}")
-        } catch (e: Exception) {
-            toast("Speichern fehlgeschlagen: " + Store.describe(e))
-        }
-    }
-
-    private fun confirmTranscribe(rec: Rec) {
-        val typed = contextInput.text.toString().trim()
-        val context = typed.ifEmpty { rec.context }
-        val mail = selectedMail()
-        val message = buildString {
-            append("Die Aufnahme wird hochgeladen und transkribiert.\n\n")
-            append("Mail an: ").append(Store.mailLabel(mail)).append('\n')
-            append("Kontext: ").append(context.ifEmpty { "(keiner)" })
-            append("\n\nMail und Kontext stellst du oben bei eingeschalteter Transkription ein.")
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Transkribieren?")
-            .setMessage(message)
-            .setPositiveButton("Hochladen") { _, _ ->
-                rec.mode = Rec.MODE_TRANSCRIBE
-                rec.context = context
-                rec.mail = mail
-                rec.phase = Rec.PHASE_NEW
-                rec.note = ""
-                Store.save(this, rec)
-                listSignature = ""
-                withPermissions { launch(RecordingService.intent(this, RecordingService.ACTION_UPLOAD)) }
-            }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    private fun confirmDelete(f: File) {
-        AlertDialog.Builder(this)
-            .setTitle("Aufnahme löschen?")
-            .setMessage("${f.name} wird auf dem Handy gelöscht. Eine Kopie in Drive bleibt erhalten.")
-            .setPositiveButton("Löschen") { _, _ ->
-                Store.deleteRecording(this, f.name)
-                listSignature = ""
-            }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    // --- Schluessel und Server -------------------------------------------
+    // --- Schluessel und Server -----------------------------------------------
 
     private fun showSecretDialog() {
         val info = TextView(this)
         info.text = "Derselbe Schlüssel muss im Apps Script als Skripteigenschaft UPLOAD_SECRET stehen. " +
             "Beim Speichern wird er in die Zwischenablage kopiert."
-        info.setPadding(0, 0, 0, dp(8))
+        info.setPadding(0, 0, 0, ui.dp(8))
 
         val input = EditText(this)
         input.hint = "Geheimer Schlüssel"
@@ -523,7 +866,7 @@ class MainActivity : Activity() {
 
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
-        box.setPadding(dp(20), dp(8), dp(20), 0)
+        box.setPadding(ui.dp(20), ui.dp(8), ui.dp(20), 0)
         box.addView(info)
         box.addView(input)
 
@@ -568,12 +911,13 @@ class MainActivity : Activity() {
                         "altes Script. Kontext, Mailauswahl und TXT gibt es erst nach dem Script-Update. " +
                             "Bis dahin gehen alle Mails an die Arbeitsadresse."
                     else -> buildString {
-                        append("aktuell ✔")
-                        if (!info.secretRequired) append(". Noch ohne Schlüssel-Schutz (UPLOAD_SECRET fehlt im Script).")
-                        if (!info.mailPrivate) append(". Private Adresse fehlt im Script (MAIL_PRIVATE), \"Privat\" geht an Arbeit.")
+                        append(if (info.api >= 3) "aktuell ✔" else "funktioniert (Version 2). Für das Löschen in Drive DirectUpload.gs auf Version 3 aktualisieren.")
+                        if (!info.secretRequired) append(" Noch ohne Schlüssel-Schutz (UPLOAD_SECRET fehlt im Script).")
+                        if (!info.mailPrivate) append(" Private Adresse fehlt im Script (MAIL_PRIVATE), \"Privat\" geht an Arbeit.")
                     }
                 }
                 Prefs.setServer(app, info.api, message)
+                if (info.authOk) Prefs.setArchiveDays(app, info.archiveDays)
                 if (info.api >= 2 && info.authOk) Prefs.setUsage(app, info.month, info.monthSeconds)
             } catch (e: Exception) {
                 Prefs.setServer(app, Prefs.serverApi(app), "nicht erreichbar (${Store.describe(e)})")
@@ -583,6 +927,7 @@ class MainActivity : Activity() {
 
     // --- An die App geteilt: Datei oder Link --------------------------------
 
+    /** Geteilte Dateien und Links werden uebernommen und sind dann "offen" - wie eine neue Aufnahme. */
     private fun handleShare(intent: Intent?) {
         if (intent == null || intent.action != Intent.ACTION_SEND) return
         // Nur einmal verarbeiten, auch wenn die Activity neu erstellt wird.
@@ -590,10 +935,7 @@ class MainActivity : Activity() {
 
         val stream = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
         if (stream != null) {
-            val name = Importer.displayName(this, stream) ?: "Datei"
-            showImportDialog("Datei: $name") { mode, context, mail ->
-                importFile(stream, intent.type, mode, context, mail)
-            }
+            importFile(stream, intent.type)
             return
         }
 
@@ -603,93 +945,31 @@ class MainActivity : Activity() {
             toast("Kein Link und keine Audiodatei gefunden.")
             return
         }
-        showImportDialog("Link: $link") { mode, context, mail ->
-            withPermissions {
-                val i = RecordingService.intent(this, RecordingService.ACTION_IMPORT_URL)
-                i.putExtra(RecordingService.EXTRA_URL, link)
-                i.putExtra(RecordingService.EXTRA_MODE, mode)
-                i.putExtra(RecordingService.EXTRA_CONTEXT, context)
-                i.putExtra(RecordingService.EXTRA_MAIL, mail)
-                launch(i)
-            }
+        withPermissions {
+            val i = RecordingService.intent(this, RecordingService.ACTION_IMPORT_URL)
+            i.putExtra(RecordingService.EXTRA_URL, link)
+            launch(i)
         }
     }
 
-    private fun importFile(uri: Uri, mimeHint: String?, mode: String, context: String, mail: String) {
-        RecordingService.status = "Übernehme Datei …"
+    private fun importFile(uri: Uri, mimeHint: String?) {
+        copying = true
+        RecordingService.report("")
         val app = applicationContext
         io.execute {
             try {
                 val imported = Importer.copyFromUri(app, uri, mimeHint)
-                val rec = Rec(imported.file.name)
-                rec.title = imported.title
-                rec.mode = mode
-                rec.context = context
-                rec.mail = mail
-                rec.phase = if (mode == Rec.MODE_LOCAL) Rec.PHASE_LOCAL else Rec.PHASE_NEW
-                Store.save(app, rec)
-                RecordingService.status = "Übernommen: ${imported.title}"
-                if (mode == Rec.MODE_TRANSCRIBE) {
-                    runOnUiThread { withPermissions { launch(RecordingService.intent(this, RecordingService.ACTION_UPLOAD)) } }
-                }
+                val rec = Store.newImported(app, imported)
+                Prefs.setFocus(app, rec.name)
             } catch (e: Exception) {
-                RecordingService.status = "Datei konnte nicht übernommen werden. " + Store.describe(e)
+                RecordingService.report("Datei konnte nicht übernommen werden. " + Store.describe(e))
+            } finally {
+                copying = false
             }
         }
     }
 
-    /** Fragt Transkription, Kontext und Mail fuer eine geteilte Datei oder einen Link ab. */
-    private fun showImportDialog(label: String, onConfirm: (String, String, String) -> Unit) {
-        val box = LinearLayout(this)
-        box.orientation = LinearLayout.VERTICAL
-        box.setPadding(dp(20), dp(8), dp(20), 0)
-
-        val what = TextView(this)
-        what.text = label
-        what.setPadding(0, 0, 0, dp(8))
-        box.addView(what)
-
-        val ctxInput = EditText(this)
-        ctxInput.hint = "Kontext (optional)"
-        ctxInput.isSingleLine = true
-        box.addView(ctxInput)
-
-        val group = RadioGroup(this)
-        group.orientation = RadioGroup.HORIZONTAL
-        val ids = mutableMapOf<String, Int>()
-        for ((key, text) in listOf(
-            Prefs.MAIL_WORK to "Arbeit",
-            Prefs.MAIL_PRIVATE to "Privat",
-            Prefs.MAIL_NONE to "Keine"
-        )) {
-            val rb = RadioButton(this)
-            rb.id = View.generateViewId()
-            rb.text = text
-            ids[key] = rb.id
-            group.addView(rb)
-        }
-        group.check(ids[Prefs.mail(this)] ?: ids.getValue(Prefs.MAIL_WORK))
-        val mailText = TextView(this)
-        mailText.text = "Mail an:"
-        mailText.setPadding(0, dp(8), 0, 0)
-        box.addView(mailText)
-        box.addView(group)
-
-        fun chosenMail(): String = ids.entries.firstOrNull { it.value == group.checkedRadioButtonId }?.key ?: Prefs.MAIL_WORK
-        fun chosenContext(): String = ctxInput.text.toString().trim()
-
-        AlertDialog.Builder(this)
-            .setTitle("An die App geteilt")
-            .setView(box)
-            .setPositiveButton("Transkribieren") { _, _ ->
-                Prefs.addRecentContext(this, chosenContext())
-                rebuildRecent()
-                onConfirm(Rec.MODE_TRANSCRIBE, chosenContext(), chosenMail())
-            }
-            .setNeutralButton("Nur speichern") { _, _ -> onConfirm(Rec.MODE_LOCAL, chosenContext(), chosenMail()) }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
+    // --- Texte -------------------------------------------------------------------
 
     private fun usageText(): String {
         val month = Prefs.usageMonth(this)
@@ -704,21 +984,20 @@ class MainActivity : Activity() {
         return "Transkribiert im $label: $minutes Min."
     }
 
-    // --- Hilfen -------------------------------------------------------------
-
-    private fun sectionTitle(text: String): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = 14f
-        t.setTypeface(t.typeface, Typeface.BOLD)
-        t.setPadding(0, dp(24), 0, dp(4))
-        return t
+    private fun archiveText(): String {
+        val days = Prefs.archiveDays(this)
+        return when {
+            days > 0 -> "Google Drive: Aufnahmen werden $days Tage nach dem Upload gelöscht (auch alte vom Recorder). Transkripte bleiben."
+            Prefs.serverApi(this) == 2 -> "Google Drive: Aufnahmen bleiben im Archiv, bis das Script auf Version 3 ist."
+            else -> ""
+        }
     }
 
-    private fun full() = LinearLayout.LayoutParams(
-        LinearLayout.LayoutParams.MATCH_PARENT,
-        LinearLayout.LayoutParams.WRAP_CONTENT
-    )
+    private fun versionName(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    } catch (e: Exception) {
+        "?"
+    }
 
     private fun toast(text: String) {
         Toast.makeText(this, text, Toast.LENGTH_LONG).show()
@@ -728,6 +1007,4 @@ class MainActivity : Activity() {
         val s = ms / 1000
         return String.format(Locale.US, "%02d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
     }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }
