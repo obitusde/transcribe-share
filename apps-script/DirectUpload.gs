@@ -1,9 +1,17 @@
 /**
  * DirectUpload.gs - Schnittstelle fuer die Android-App "Aufnahme".
- * Version 2 (2026-11-01)
+ * Version 3 (2026-11-02)
  *
- * Ersetzt die Version 1 dieser Datei komplett. Neu gegenueber Version 1:
+ * Neu in Version 3:
+ *   - Aufnahmen im Archivordner werden 28 Tage nach dem Upload in den
+ *     Drive-Papierkorb gelegt (Google leert ihn nach 30 Tagen endgueltig).
+ *     Das gilt fuer ALLE Audiodateien im Archiv, auch alte aus dem Google
+ *     Recorder. Transkripte (.txt, Mails) bleiben. Ein taeglicher Trigger
+ *     (cleanupArchive, nachts um 3) erledigt das; er richtet sich beim
+ *     ersten "hello" der App selbst ein. Von Hand: cleanupArchiveNow().
+ *   - Code.gs bleibt gegenueber Version 2 unveraendert.
  *
+ * Version 2 (ersetzte Version 1):
  *   - Geheimer Schluessel (Skripteigenschaft UPLOAD_SECRET). Ist er gesetzt,
  *     wird JEDE POST-Anfrage ohne passenden Schluessel abgelehnt - auch der
  *     alte Base64-Weg in doPost(), der sonst ungeschuetzt weiterliefe.
@@ -26,7 +34,8 @@
  * diese Zeile (z. B. aus dem Google Recorder per Drive geteilt) laufen genau
  * wie bisher.
  *
- * EINBAU: siehe apps-script/ANLEITUNG-APP-V2.md
+ * EINBAU: siehe apps-script/ANLEITUNG-APP-V2.md (erstmalig) und
+ * apps-script/ANLEITUNG-APP-V3.md (Update von Version 2).
  * Code.gs braucht zwei Ein-Zeilen-Aenderungen, die applyAppOptions_() und
  * deliverTranscript_() aus dieser Datei aufrufen.
  */
@@ -38,13 +47,19 @@ var DRIVE_RESUMABLE_INIT_URL =
 var ALLOWED_UPLOAD_ORIGINS = ['https://obitusde.github.io'];
 
 /** Die App fragt per "hello" danach und schaltet neue Funktionen erst ab 2 frei. */
-var APP_API_VERSION = 2;
+var APP_API_VERSION = 3;
 
 var APP_MAIL_CHOICES = ['work', 'private', 'none'];
 var APP_CONTEXT_MAX = 500;
 var APP_MARKER_RE = /(?:^|\n)#app mail=(work|private|none)\s*$/;
 var TRANSCRIPT_FOLDER_NAME = 'Transkripte';
 var USAGE_TZ = 'Europe/Zurich';
+
+/** So viele Tage nach dem Upload bleibt eine Aufnahme im Drive-Archiv. */
+var ARCHIVE_KEEP_DAYS = 28;
+var ARCHIVE_CLEANUP_HANDLER = 'cleanupArchive';
+/** Ein Lauf darf hoechstens so lange dauern (Apps-Script-Limit: 6 Min.). */
+var ARCHIVE_CLEANUP_MAX_MS = 4 * 60 * 1000;
 
 /**
  * Router, aufgerufen ganz oben in doPost().
@@ -100,7 +115,9 @@ function hello_() {
     secretRequired: !!getUploadSecret_(),
     mailPrivate: !!props.getProperty('MAIL_PRIVATE'),
     month: Utilities.formatDate(now, USAGE_TZ, 'yyyy-MM'),
-    monthSeconds: Number(props.getProperty(usageKey_(now)) || 0)
+    monthSeconds: Number(props.getProperty(usageKey_(now)) || 0),
+    archiveDays: ARCHIVE_KEEP_DAYS,
+    archiveCleanup: ensureArchiveCleanupTrigger_()
   };
 }
 
@@ -377,6 +394,80 @@ function findTranscriptFile_(fileName) {
   if (!folder) return null;
   var files = folder.getFilesByName(transcriptFileName_(fileName));
   return files.hasNext() ? files.next() : null;
+}
+
+// --- Drive-Archiv aufraeumen --------------------------------------------
+
+/**
+ * Richtet den taeglichen Aufraeum-Trigger ein, falls er fehlt.
+ * Gibt true zurueck, wenn er (jetzt) existiert. Wirft nie.
+ */
+function ensureArchiveCleanupTrigger_() {
+  try {
+    var exists = ScriptApp.getProjectTriggers().some(function (t) {
+      return t.getHandlerFunction() === ARCHIVE_CLEANUP_HANDLER;
+    });
+    if (!exists) {
+      ScriptApp.newTrigger(ARCHIVE_CLEANUP_HANDLER).timeBased().everyDays(1).atHour(3).create();
+    }
+    return true;
+  } catch (err) {
+    Logger.log('Aufraeum-Trigger konnte nicht eingerichtet werden: ' + err.message);
+    return false;
+  }
+}
+
+/**
+ * Wann die Datei in Drive kam bzw. zuletzt bearbeitet wurde (Umbenennen beim
+ * Transkriptionsstart). Gezaehlt wird ab dem spaeteren der beiden Zeitpunkte.
+ */
+function archiveReferenceTime_(file) {
+  var created = file.getDateCreated();
+  var updated = file.getLastUpdated();
+  return Math.max(created ? created.getTime() : 0, updated ? updated.getTime() : 0);
+}
+
+/**
+ * Taeglich per Trigger: Audiodateien im Archiv, die aelter als
+ * ARCHIVE_KEEP_DAYS sind, in den Papierkorb. Nur Audiodateien (isAudioFile),
+ * nur direkt im Archivordner. Gibt die Zahl der geloeschten Dateien zurueck.
+ */
+function cleanupArchive() {
+  var started = Date.now();
+  var limit = started - ARCHIVE_KEEP_DAYS * 24 * 60 * 60 * 1000;
+  var archive = DriveApp.getFolderById(CONFIG.FOLDER_ARCHIVE_ID);
+  var files = archive.getFiles();
+  var trashed = 0;
+  var kept = 0;
+
+  while (files.hasNext()) {
+    if (Date.now() - started > ARCHIVE_CLEANUP_MAX_MS) {
+      Logger.log('Zeitlimit erreicht, der Rest folgt beim naechsten Lauf.');
+      break;
+    }
+    var file = files.next();
+    try {
+      if (!isAudioFile(file.getName())) continue;
+      if (archiveReferenceTime_(file) < limit) {
+        file.setTrashed(true);
+        trashed++;
+      } else {
+        kept++;
+      }
+    } catch (err) {
+      Logger.log('Konnte "' + file.getName() + '" nicht loeschen: ' + err.message);
+    }
+  }
+
+  Logger.log('Archiv aufgeraeumt: ' + trashed + ' Aufnahme(n) in den Papierkorb, ' +
+    kept + ' juenger als ' + ARCHIVE_KEEP_DAYS + ' Tage bleiben.');
+  return trashed;
+}
+
+/** Zum einmaligen Ausfuehren im Editor: richtet den Trigger ein und raeumt sofort auf. */
+function cleanupArchiveNow() {
+  ensureArchiveCleanupTrigger_();
+  return cleanupArchive();
 }
 
 /** Header-Namen kommen je nach Aufruf mal gross-, mal kleingeschrieben. */
