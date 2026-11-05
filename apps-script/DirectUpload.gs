@@ -1,8 +1,21 @@
 /**
  * DirectUpload.gs - Schnittstelle fuer die Android-App "Aufnahme".
- * Version 3 (2026-11-02)
+ * Version 4 (2026-11-05)
  *
- * Neu in Version 3:
+ * Neu in Version 4:
+ *   - Kurzer Titel pro Gespraech, damit man in der Mail sofort sieht, welches
+ *     Gespraech es war. Ein kleines Sprachmodell ueber das LLM Gateway von
+ *     AssemblyAI (gleicher API-Key, kein neuer Dienst) liest Zusammenfassung
+ *     und Transkript und liefert 3-8 Woerter in der Sprache des Gespraechs.
+ *     Faellt das aus: erste Ueberschrift der AssemblyAI-Zusammenfassung,
+ *     sonst der Kontext aus der App.
+ *   - Mail-Betreff "Mo 02.11.2026 09:27 · Titel" (Wochentag, Datum, Uhrzeit
+ *     der Aufnahme, ohne Sekunden). Dafuer aendert sich in Code.gs die
+ *     Funktion buildMeetingSubjectAndHeader (komplette Code.gs separat).
+ *   - Der Titel steht auch in der ersten Zeile der .txt ("Titel: ..."), die
+ *     App zeigt ihn in der Liste an.
+ *
+ * Version 3:
  *   - Aufnahmen im Archivordner werden 28 Tage nach dem Upload in den
  *     Drive-Papierkorb gelegt (Google leert ihn nach 30 Tagen endgueltig).
  *     Das gilt fuer ALLE Audiodateien im Archiv, auch alte aus dem Google
@@ -47,7 +60,7 @@ var DRIVE_RESUMABLE_INIT_URL =
 var ALLOWED_UPLOAD_ORIGINS = ['https://obitusde.github.io'];
 
 /** Die App fragt per "hello" danach und schaltet neue Funktionen erst ab 2 frei. */
-var APP_API_VERSION = 3;
+var APP_API_VERSION = 4;
 
 var APP_MAIL_CHOICES = ['work', 'private', 'none'];
 var APP_CONTEXT_MAX = 500;
@@ -60,6 +73,16 @@ var ARCHIVE_KEEP_DAYS = 28;
 var ARCHIVE_CLEANUP_HANDLER = 'cleanupArchive';
 /** Ein Lauf darf hoechstens so lange dauern (Apps-Script-Limit: 6 Min.). */
 var ARCHIVE_CLEANUP_MAX_MS = 4 * 60 * 1000;
+
+/** Titel pro Gespraech ueber das LLM Gateway von AssemblyAI. */
+var LLM_GATEWAY_URL = 'https://llm-gateway.assemblyai.com/v1/chat/completions';
+/** Der Reihe nach probiert; das erste brauchbare Ergebnis gilt. */
+var TITLE_MODELS = ['claude-haiku-4-5-20251001', 'gemini-2.5-flash-lite'];
+var TITLE_MAX = 60;
+/** So viel Transkript geht ans Modell: Anfang und Ende (lange Gespraeche). */
+var TITLE_TRANSCRIPT_HEAD = 40000;
+var TITLE_TRANSCRIPT_TAIL = 8000;
+var WEEKDAYS_DE = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
 
 /**
  * Router, aufgerufen ganz oben in doPost().
@@ -311,15 +334,22 @@ function deliverTranscript_(file, fileName, transcriptText, summaryInfo, confide
   var opts = readAppOptions_(file);
   var text = opts.context ? 'Kontext: ' + opts.context + '\n\n' + transcriptText : transcriptText;
 
+  // Kurzer Titel fuer Betreff, .txt und App. Darf nie die Mail verhindern.
+  var title = buildConversationTitle_(transcriptText, summaryInfo, opts.context);
+  var mailSummary = {
+    text: summaryInfo && summaryInfo.text ? summaryInfo.text : null,
+    headline: title || null
+  };
+
   try {
-    saveTranscriptFile_(fileName, text, summaryInfo);
+    saveTranscriptFile_(fileName, text, summaryInfo, title);
   } catch (err) {
     Logger.log('Transkript-Datei konnte nicht gespeichert werden: ' + err.message);
   }
 
   var recipient = resolveRecipient_(opts.mail);
   if (recipient) {
-    sendEmailTranscriptOnly(recipient, fileName, text, file.getLastUpdated(), summaryInfo, confidence);
+    sendEmailTranscriptOnly(recipient, fileName, text, file.getLastUpdated(), mailSummary, confidence);
   } else {
     Logger.log('Keine Mail fuer "' + fileName + '" (so in der App gewaehlt).');
   }
@@ -371,10 +401,11 @@ function transcriptFolder_(create) {
   return create ? parent.createFolder(TRANSCRIPT_FOLDER_NAME) : null;
 }
 
-function saveTranscriptFile_(fileName, text, summaryInfo) {
+function saveTranscriptFile_(fileName, text, summaryInfo, title) {
   var folder = transcriptFolder_(true);
   var name = transcriptFileName_(fileName);
   var parts = [];
+  if (title) parts.push('Titel: ' + title, '');
   if (summaryInfo && summaryInfo.text) {
     parts.push('Zusammenfassung:', summaryInfo.text, '', '---', '');
   }
@@ -394,6 +425,105 @@ function findTranscriptFile_(fileName) {
   if (!folder) return null;
   var files = folder.getFilesByName(transcriptFileName_(fileName));
   return files.hasNext() ? files.next() : null;
+}
+
+// --- Titel und Betreff -----------------------------------------------------
+
+/**
+ * "2026-11-02_09-27-49" -> "Mo 02.11.2026 09:27". Aufruf aus
+ * buildMeetingSubjectAndHeader() in Code.gs.
+ */
+function formatSubjectStamp_(stamp) {
+  var m = String(stamp || '').match(/^(\d{4})-(\d{2})-(\d{2})[_ ](\d{2})-(\d{2})/);
+  if (!m) return String(stamp || '');
+  var weekday = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getDay();
+  return WEEKDAYS_DE[weekday] + ' ' + m[3] + '.' + m[2] + '.' + m[1] + ' ' + m[4] + ':' + m[5];
+}
+
+/**
+ * Bester verfuegbarer kurzer Titel: Sprachmodell, sonst erste Ueberschrift
+ * der AssemblyAI-Zusammenfassung, sonst der Kontext. Wirft nie.
+ */
+function buildConversationTitle_(transcriptText, summaryInfo, context) {
+  var title = '';
+  try {
+    title = askTitle_(transcriptText, summaryInfo, context);
+  } catch (err) {
+    Logger.log('Titel vom Sprachmodell nicht verfuegbar: ' + err.message);
+  }
+  if (!title && summaryInfo && summaryInfo.headline) title = cleanTitle_(summaryInfo.headline);
+  if (!title && context) title = cleanTitle_(context);
+  return title;
+}
+
+function askTitle_(transcriptText, summaryInfo, context) {
+  var text = String(transcriptText || '');
+  if (!text.trim()) return '';
+  var excerpt = text.length > TITLE_TRANSCRIPT_HEAD + TITLE_TRANSCRIPT_TAIL
+    ? text.slice(0, TITLE_TRANSCRIPT_HEAD) + '\n[...]\n' + text.slice(-TITLE_TRANSCRIPT_TAIL)
+    : text;
+
+  var parts = [
+    'Formuliere einen sehr kurzen Titel fuer dieses Gespraech (3 bis 8 Woerter, hoechstens ' +
+      TITLE_MAX + ' Zeichen), damit man im Mail-Postfach sofort erkennt, welches Gespraech es war. ' +
+      'Nenne konkret das Hauptthema und, wenn klar, die wichtigsten Personen. ' +
+      'Schreibe in der Hauptsprache des Gespraechs. ' +
+      'Gib nur den Titel aus: kein Datum, keine Anfuehrungszeichen, kein Punkt am Ende.'
+  ];
+  if (context) parts.push('Hinweis der Person, die aufgenommen hat: ' + context);
+  if (summaryInfo && summaryInfo.text) parts.push('Zusammenfassung des ganzen Gespraechs:\n' + summaryInfo.text);
+  parts.push('Transkript:\n' + excerpt);
+  var prompt = parts.join('\n\n');
+  var key = getApiKey();
+
+  for (var i = 0; i < TITLE_MODELS.length; i++) {
+    try {
+      var res = UrlFetchApp.fetch(LLM_GATEWAY_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        headers: { Authorization: key },
+        payload: JSON.stringify({
+          model: TITLE_MODELS[i],
+          messages: [{ role: 'user', content: prompt }],
+          max_tokens: 60
+        }),
+        muteHttpExceptions: true
+      });
+      if (res.getResponseCode() !== 200) {
+        Logger.log('Titel (' + TITLE_MODELS[i] + '): HTTP ' + res.getResponseCode() + ' ' +
+          res.getContentText().slice(0, 200));
+        continue;
+      }
+      var title = cleanTitle_(readChatContent_(JSON.parse(res.getContentText())));
+      if (title) return title;
+    } catch (err) {
+      Logger.log('Titel (' + TITLE_MODELS[i] + '): ' + err.message);
+    }
+  }
+  return '';
+}
+
+/** Text aus einer Chat-Completions-Antwort (String oder Liste von Teilen). */
+function readChatContent_(data) {
+  var msg = data && data.choices && data.choices[0] && data.choices[0].message;
+  var content = msg && msg.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(function (p) { return (p && p.text) || ''; }).join('');
+  }
+  return '';
+}
+
+/** Erste Zeile, ohne "Titel:", Anfuehrungszeichen, Markdown und Schlusspunkt. */
+function cleanTitle_(raw) {
+  var lines = String(raw || '').split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+  var line = lines.length ? lines[0] : '';
+  line = line.replace(/^(titel|title)\s*:\s*/i, '');
+  line = line.replace(/^[\s"'„“”«»*#_`-]+/, '');
+  line = line.replace(/[\s"'„“”«»*#_`.]+$/, '');
+  line = line.replace(/\s+/g, ' ').trim();
+  if (line.length > TITLE_MAX) line = line.slice(0, TITLE_MAX - 1).trim() + '…';
+  return line;
 }
 
 // --- Drive-Archiv aufraeumen --------------------------------------------
