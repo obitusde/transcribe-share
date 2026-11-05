@@ -72,7 +72,8 @@ object Notifier {
 
     fun finished(context: Context, r: Rec) {
         val title = if (r.phase == Rec.PHASE_DONE) "Transkript fertig" else "Transkription fehlgeschlagen"
-        post(context, 1000 + (r.name.hashCode() and 0xFFFF), result(context, title, Store.label(r) + ": " + r.note))
+        val what = Store.label(r) + if (r.topic.isNotBlank()) " · " + r.topic else ""
+        post(context, 1000 + (r.name.hashCode() and 0xFFFF), result(context, title, what + "\n" + r.note))
     }
 
     /** Aufnahme gespeichert, aber noch nicht entschieden (z. B. per Benachrichtigung gestoppt). */

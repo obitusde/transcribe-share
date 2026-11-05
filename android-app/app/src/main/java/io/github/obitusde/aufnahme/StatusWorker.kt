@@ -80,6 +80,7 @@ class StatusWorker(context: Context, params: WorkerParameters) : Worker(context,
                     if (text != null) {
                         Store.txtFile(c, rec.name).writeText(text)
                         rec.hasTxt = true
+                        rec.topic = Store.topicFrom(text)
                         // Transkript ist sicher auf dem Handy: Aufnahme wird nicht mehr gebraucht.
                         Store.deleteAudio(c, rec)
                     }
