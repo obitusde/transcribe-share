@@ -30,6 +30,7 @@ import android.widget.ProgressBar
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
@@ -88,6 +89,30 @@ class MainActivity : Activity() {
 
     @Volatile
     private var copying = false
+
+    @Volatile
+    private var converting = false
+
+    @Volatile
+    private var convertPct = 0
+
+    private val player = Player()
+
+    /** Ein Abspiel-Balken in einer Karte. inTop = im Entscheidungsbereich oben. */
+    private class PlayerRow(
+        val name: String,
+        val file: File,
+        val durationMs: Int,
+        val inTop: Boolean,
+        val button: android.widget.Button,
+        val seek: SeekBar,
+        val time: TextView
+    ) {
+        var dragging = false
+    }
+
+    private val playerRows = mutableListOf<PlayerRow>()
+    private var buildingTop = false
 
     private val io = Executors.newSingleThreadExecutor()
     private val handler = Handler(Looper.getMainLooper())
@@ -187,7 +212,13 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    override fun onStop() {
+        player.pause()
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        player.release()
         io.shutdown()
         super.onDestroy()
     }
@@ -206,18 +237,22 @@ class MainActivity : Activity() {
         if (key != topKey) {
             topKey = key
             topBox.removeAllViews()
+            playerRows.removeAll { it.inTop }
             contextInput = null
             mailGroup = null
             timerView = null
+            buildingTop = true
             topBox.addView(
                 if (focus != null && !recording) decisionCard(focus) else recorderCard(recording, paused),
                 ui.full()
             )
+            buildingTop = false
         }
         timerView?.text = formatElapsed(RecordingService.elapsedMs())
 
         renderBanner()
         renderList(focus)
+        updatePlayers()
 
         serverView.text = "Server: " + Prefs.serverMessage(this)
         usageView.text = usageText()
@@ -243,18 +278,19 @@ class MainActivity : Activity() {
         val status = RecordingService.status
         val fresh = status.isNotEmpty() && SystemClock.elapsedRealtime() - RecordingService.statusAt < STATUS_SHOW_MS
         val importing = RecordingService.importing
-        val show = importing || copying || fresh
+        val show = importing || copying || converting || fresh
         bannerBox.visibility = if (show) View.VISIBLE else View.GONE
         if (!show) return
         bannerText.text = when {
+            converting -> "Wandle in M4A um … $convertPct %"
             status.isNotEmpty() -> status
             copying -> "Übernehme Datei …"
             else -> "Lade Datei vom Link …"
         }
-        val busy = importing || copying
+        val busy = importing || copying || converting
         bannerBar.visibility = if (busy) View.VISIBLE else View.GONE
-        val pct = RecordingService.importPct
-        bannerBar.isIndeterminate = !importing || pct < 0
+        val pct = if (converting) convertPct else RecordingService.importPct
+        bannerBar.isIndeterminate = !(importing || converting) || pct < 0
         if (!bannerBar.isIndeterminate) bannerBar.progress = pct
     }
 
@@ -312,6 +348,7 @@ class MainActivity : Activity() {
     }
 
     private fun launchStart() {
+        player.release()
         RecordingService.report("")
         launch(RecordingService.intent(this, RecordingService.ACTION_START))
     }
@@ -348,8 +385,7 @@ class MainActivity : Activity() {
         )
         addIdentity(c, rec)
 
-        val listen = ui.button("▶  Anhören", Ui.Kind.TONAL) { openAudio(rec) }
-        c.addView(listen, ui.margins(ui.wrap(), t = 10))
+        addPlayer(c, rec)
 
         c.addView(divider(), ui.margins(ui.full(), t = 16, b = 14))
 
@@ -425,19 +461,27 @@ class MainActivity : Activity() {
         c.addView(divider(), ui.margins(ui.full(), t = 18, b = 14))
         c.addView(ui.text("Oder ohne Transkription", 17f, ui.text, bold = true), ui.full())
         c.addView(
-            ui.text("Die Aufnahme bleibt nur auf dem Handy. Mit Teilen gibst du sie z. B. an Claude oder Gemini.", 13f, ui.sub),
+            ui.text(
+                "Die Aufnahme bleibt nur auf dem Handy. Mit Teilen gibst du sie z. B. an Claude oder Gemini. " +
+                    "Für Copilot, Word oder WhatsApp: „Als M4A teilen“.",
+                13f, ui.sub
+            ),
             ui.margins(ui.full(), t = 2, b = 10)
         )
         val keep = ui.button("Lokal behalten", Ui.Kind.TONAL) { decideLocal(rec, shared = false) }
         val share = ui.button("Teilen …", Ui.Kind.TONAL) {
-            shareFile(Store.audioFile(this, rec.name), Store.mimeFor(Store.audioFile(this, rec.name)), "Aufnahme teilen")
+            shareAudio(rec)
             decideLocal(rec, shared = true)
         }
-        if (isLocal) {
-            c.addView(ui.row(share), ui.full())
-        } else {
-            c.addView(ui.row(keep, share), ui.full())
+        val m4a = ui.button("Als M4A teilen", Ui.Kind.TONAL) {
+            decideLocal(rec, shared = true)
+            shareAsM4a(rec)
         }
+        if (!isLocal) c.addView(ui.row(keep), ui.full())
+        c.addView(
+            if (isOgg(rec)) ui.row(share, m4a) else ui.row(share),
+            ui.margins(ui.full(), t = if (isLocal) 0 else 10)
+        )
         val delete = ui.button("Löschen", Ui.Kind.DANGER) { confirmDelete(rec) }
         val later = ui.button(if (isLocal) "Abbrechen" else "Später entscheiden", Ui.Kind.OUTLINE) { closeFocus(rec) }
         c.addView(ui.row(delete, later), ui.margins(ui.full(), t = 10))
@@ -516,13 +560,14 @@ class MainActivity : Activity() {
             for (r in recs) {
                 append('|').append(r.name).append(r.phase).append(r.note).append(r.hasTxt).append(r.shared)
                 append(r.context).append(r.progress).append(Store.since(r)).append(r.durationMs)
-                append(r.title).append(Store.hasAudio(this@MainActivity, r))
+                append(r.title).append(r.topic).append(Store.hasAudio(this@MainActivity, r))
             }
         }
         if (sig == listSignature) return
         listSignature = sig
 
         listBox.removeAllViews()
+        playerRows.removeAll { !it.inTop }
         val open = recs.filter { it.phase == Rec.PHASE_OPEN }
         val working = recs.filter {
             it.phase in setOf(Rec.PHASE_NEW, Rec.PHASE_UPLOADING, Rec.PHASE_UPLOAD_FAILED, Rec.PHASE_TRANSCRIBING, Rec.PHASE_FAILED)
@@ -564,7 +609,12 @@ class MainActivity : Activity() {
 
     /** Datum/Uhrzeit gross, darunter Titel (bei uebernommenen Dateien) und Dauer/Groesse. */
     private fun addIdentity(box: LinearLayout, r: Rec) {
-        box.addView(ui.text(Store.whenText(r), 16f, ui.text, bold = true), ui.margins(ui.full(), t = 6))
+        if (r.topic.isNotBlank()) {
+            box.addView(ui.text(r.topic, 17f, ui.text, bold = true), ui.margins(ui.full(), t = 6))
+            box.addView(ui.text(Store.whenText(r), 14f, ui.text), ui.margins(ui.full(), t = 2))
+        } else {
+            box.addView(ui.text(Store.whenText(r), 16f, ui.text, bold = true), ui.margins(ui.full(), t = 6))
+        }
         if (r.title.isNotBlank()) box.addView(ui.text(r.title, 14f, ui.text), ui.margins(ui.full(), t = 2))
         val size = if (Store.hasAudio(this, r)) Store.sizeLine(this, r) else Store.durationText(r.durationMs)
         if (size.isNotEmpty()) box.addView(ui.text(size, 13f, ui.sub), ui.margins(ui.full(), t = 2))
@@ -611,10 +661,10 @@ class MainActivity : Activity() {
         val c = ui.card(stripe = ui.orange)
         c.addView(ui.badge("⚠  Noch nicht entschieden", ui.orange, ui.orangeSoft), ui.wrap())
         addIdentity(c, r)
+        addPlayer(c, r)
         buttons(
             c,
             "Entscheiden" to (Ui.Kind.PRIMARY to { openFocus(r) }),
-            "▶ Anhören" to (Ui.Kind.TONAL to { openAudio(r) }),
             "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
         )
         return c
@@ -659,7 +709,9 @@ class MainActivity : Activity() {
                 contextLine(c, r)
                 val items = mutableListOf<Pair<String, Pair<Ui.Kind, () -> Unit>>>()
                 if (Store.hasAudio(this, r)) {
+                    addPlayer(c, r)
                     items += "Teilen" to (Ui.Kind.TONAL to { shareAudio(r) })
+                    if (isOgg(r)) items += "Als M4A teilen" to (Ui.Kind.TONAL to { shareAsM4a(r) })
                     items += "Lokal behalten" to (Ui.Kind.TONAL to { decideLocal(r, shared = false) })
                 }
                 items += "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
@@ -683,6 +735,7 @@ class MainActivity : Activity() {
         }
         c.addView(ui.text(info, 13f, ui.sub), ui.margins(ui.full(), t = 2))
         contextLine(c, r)
+        if (audio) addPlayer(c, r)
         val items = mutableListOf<Pair<String, Pair<Ui.Kind, () -> Unit>>>()
         if (hasTxt) {
             items += "Lesen" to (Ui.Kind.PRIMARY to { showTranscript(r) })
@@ -690,6 +743,7 @@ class MainActivity : Activity() {
             items += "TXT speichern" to (Ui.Kind.TONAL to { saveToDownloads(Store.txtFile(this, r.name)) })
         }
         if (audio) items += "Audio teilen" to (Ui.Kind.OUTLINE to { shareAudio(r) })
+        if (audio && isOgg(r)) items += "Als M4A teilen" to (Ui.Kind.OUTLINE to { shareAsM4a(r) })
         items += "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
         buttons(c, *items.toTypedArray())
         return c
@@ -700,13 +754,13 @@ class MainActivity : Activity() {
         addIdentity(c, r)
         statusLine(c, "✔ Lokal behalten" + (if (r.shared) " · geteilt" else ""), ui.grey)
         contextLine(c, r)
-        buttons(
-            c,
-            "▶ Anhören" to (Ui.Kind.TONAL to { openAudio(r) }),
-            "Teilen" to (Ui.Kind.TONAL to { shareAudio(r) }),
-            "Transkribieren" to (Ui.Kind.OUTLINE to { openFocus(r) }),
-            "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
-        )
+        addPlayer(c, r)
+        val items = mutableListOf<Pair<String, Pair<Ui.Kind, () -> Unit>>>()
+        items += "Teilen" to (Ui.Kind.TONAL to { shareAudio(r) })
+        if (isOgg(r)) items += "Als M4A teilen" to (Ui.Kind.TONAL to { shareAsM4a(r) })
+        items += "Transkribieren" to (Ui.Kind.OUTLINE to { openFocus(r) })
+        items += "Löschen" to (Ui.Kind.DANGER to { confirmDelete(r) })
+        buttons(c, *items.toTypedArray())
         return c
     }
 
@@ -720,11 +774,123 @@ class MainActivity : Activity() {
     private fun shareAudio(r: Rec) {
         val f = Store.audioFile(this, r.name)
         shareFile(f, Store.mimeFor(f), "Aufnahme teilen")
+        markShared(r)
+    }
+
+    private fun markShared(r: Rec) {
         val fresh = Store.get(this, r.name)
         if (fresh.phase == Rec.PHASE_LOCAL && !fresh.shared) {
             fresh.shared = true
             Store.save(this, fresh)
         }
+    }
+
+    private fun isOgg(r: Rec): Boolean = r.name.substringAfterLast('.').lowercase() == "ogg"
+
+    /** Ogg auf dem Handy in M4A umwandeln (fuer Copilot, Word, WhatsApp) und dann teilen. */
+    private fun shareAsM4a(r: Rec) {
+        if (converting) {
+            toast("Es wird schon eine Aufnahme umgewandelt.")
+            return
+        }
+        val src = Store.audioFile(this, r.name)
+        if (!src.isFile) {
+            toast("Die Aufnahme ist nicht mehr auf dem Handy.")
+            return
+        }
+        converting = true
+        convertPct = 0
+        val app = applicationContext
+        io.execute {
+            try {
+                val out = Converter.toM4a(app, src) { convertPct = it }
+                runOnUiThread {
+                    converting = false
+                    if (!isFinishing && !isDestroyed) {
+                        shareFile(out, "audio/mp4", "Aufnahme teilen (M4A)")
+                        markShared(r)
+                    }
+                }
+            } catch (e: Exception) {
+                converting = false
+                RecordingService.report("Umwandeln in M4A ging nicht. " + Store.describe(e))
+            }
+        }
+    }
+
+    // --- Abspielen in der App ---------------------------------------------------
+
+    private fun addPlayer(box: LinearLayout, r: Rec) {
+        val f = Store.audioFile(this, r.name)
+        if (!f.isFile) return
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+
+        val button = ui.button("▶", Ui.Kind.TONAL) {}
+        button.textSize = 18f
+        button.setPadding(0, 0, 0, 0)
+        val seek = SeekBar(this)
+        seek.progressTintList = ColorStateList.valueOf(ui.accent)
+        seek.thumbTintList = ColorStateList.valueOf(ui.accent)
+        seek.progressBackgroundTintList = ColorStateList.valueOf(ui.line)
+        val duration = r.durationMs.toInt().coerceAtLeast(0)
+        seek.max = duration.coerceAtLeast(1)
+        val time = ui.text(timeText(0, duration), 13f, ui.sub)
+
+        val pr = PlayerRow(r.name, f, duration, buildingTop, button, seek, time)
+        button.setOnClickListener {
+            player.toggle(r.name, f, if (player.current == r.name) 0 else seek.progress)
+            if (player.error.isNotEmpty()) toast(player.error)
+            updatePlayers()
+        }
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                if (fromUser) time.text = timeText(progress, bar.max)
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar) {
+                pr.dragging = true
+            }
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                pr.dragging = false
+                player.seek(r.name, f, bar.progress)
+                if (player.error.isNotEmpty()) toast(player.error)
+                updatePlayers()
+            }
+        })
+
+        row.addView(button, LinearLayout.LayoutParams(ui.dp(52), ui.dp(46)))
+        row.addView(seek, ui.weighted())
+        row.addView(time, ui.wrap())
+        box.addView(row, ui.margins(ui.full(), t = 10))
+        playerRows += pr
+    }
+
+    /** Knopf, Balken und Zeit der Abspiel-Zeilen auf den aktuellen Stand bringen. */
+    private fun updatePlayers() {
+        for (pr in playerRows) {
+            val playing = player.isPlaying(pr.name)
+            pr.button.text = if (playing) "❚❚" else "▶"
+            val loaded = player.current == pr.name
+            val duration = player.duration(pr.name).takeIf { it > 0 } ?: pr.durationMs
+            if (duration > 0 && pr.seek.max != duration) pr.seek.max = duration
+            if (!pr.dragging && loaded) {
+                val pos = player.position(pr.name)
+                pr.seek.progress = pos
+                pr.time.text = timeText(pos, duration)
+            }
+        }
+    }
+
+    private fun timeText(posMs: Int, durationMs: Int): String {
+        fun fmt(ms: Int): String {
+            val s = ms / 1000
+            return if (s >= 3600) String.format(Locale.US, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+            else String.format(Locale.US, "%d:%02d", s / 60, s % 60)
+        }
+        return if (durationMs > 0) fmt(posMs) + " / " + fmt(durationMs) else fmt(posMs)
     }
 
     private fun shareTxt(r: Rec) {
@@ -745,19 +911,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun openAudio(r: Rec) {
-        try {
-            val f = Store.audioFile(this, r.name)
-            val uri = FileProvider.getUriForFile(this, "$packageName.files", f)
-            val view = Intent(Intent.ACTION_VIEW)
-            view.setDataAndType(uri, Store.mimeFor(f))
-            view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            startActivity(view)
-        } catch (e: Exception) {
-            toast("Keine App zum Abspielen gefunden.")
-        }
-    }
-
     private fun showTranscript(r: Rec) {
         val text = try {
             Store.txtFile(this, r.name).readText()
@@ -774,7 +927,7 @@ class MainActivity : Activity() {
         val sv = ScrollView(this)
         sv.addView(t)
         AlertDialog.Builder(this)
-            .setTitle(Store.whenText(r))
+            .setTitle(r.topic.ifBlank { Store.whenText(r) })
             .setView(sv)
             .setPositiveButton("Teilen") { _, _ -> shareTxt(r) }
             .setNegativeButton("Schließen", null)
@@ -812,6 +965,7 @@ class MainActivity : Activity() {
             .setTitle("Löschen?")
             .setMessage(Store.whenText(r) + "\n\n" + message)
             .setPositiveButton("Löschen") { _, _ ->
+                if (player.current == r.name) player.release()
                 Store.deleteRecording(this, r.name)
                 Notifier.cancelDecide(this, r.name)
                 topKey = ""
@@ -911,7 +1065,13 @@ class MainActivity : Activity() {
                         "altes Script. Kontext, Mailauswahl und TXT gibt es erst nach dem Script-Update. " +
                             "Bis dahin gehen alle Mails an die Arbeitsadresse."
                     else -> buildString {
-                        append(if (info.api >= 3) "aktuell ✔" else "funktioniert (Version 2). Für das Löschen in Drive DirectUpload.gs auf Version 3 aktualisieren.")
+                        append(
+                            when {
+                                info.api >= 4 -> "aktuell ✔"
+                                info.api == 3 -> "funktioniert (Version 3). Für den neuen Mail-Betreff mit Titel DirectUpload.gs und Code.gs aktualisieren."
+                                else -> "funktioniert (Version 2). Für Titel im Betreff und Löschen in Drive DirectUpload.gs und Code.gs aktualisieren."
+                            }
+                        )
                         if (!info.secretRequired) append(" Noch ohne Schlüssel-Schutz (UPLOAD_SECRET fehlt im Script).")
                         if (!info.mailPrivate) append(" Private Adresse fehlt im Script (MAIL_PRIVATE), \"Privat\" geht an Arbeit.")
                     }

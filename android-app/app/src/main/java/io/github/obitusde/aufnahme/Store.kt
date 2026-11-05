@@ -36,6 +36,8 @@ class Rec(val name: String) {
     var audioDeleted = false
     /** Ueber "Teilen" an eine andere App gegeben. */
     var shared = false
+    /** Kurzer Titel aus dem Inhalt (erste Zeile "Titel: ..." im Transkript). */
+    var topic = ""
 
     fun toJson(): String = JSONObject()
         .put("mode", mode)
@@ -55,6 +57,7 @@ class Rec(val name: String) {
         .put("sizeBytes", sizeBytes)
         .put("audioDeleted", audioDeleted)
         .put("shared", shared)
+        .put("topic", topic)
         .toString()
 
     companion object {
@@ -96,6 +99,7 @@ class Rec(val name: String) {
                     sizeBytes = o.optLong("sizeBytes", 0L)
                     audioDeleted = o.optBoolean("audioDeleted", false)
                     shared = o.optBoolean("shared", false)
+                    topic = o.optString("topic", "")
                 }
             } catch (e: JSONException) {
                 null
@@ -237,6 +241,7 @@ object Store {
 
     fun cleanup(context: Context) {
         val now = System.currentTimeMillis()
+        Converter.cleanup(context, DAY_MS)
         val active = RecordingService.recordingFile
         val p = prefs(context)
         for (f in audioFiles(context)) {
@@ -350,6 +355,11 @@ object Store {
 
     /** Titel fuer uebernommene Dateien, sonst Datum und Uhrzeit. */
     fun label(r: Rec): String = r.title.ifBlank { shortWhen(r) }
+
+    /** Titel aus der ersten Zeile "Titel: ..." des Transkripts (vom Script), sonst "". */
+    fun topicFrom(text: String): String =
+        text.lineSequence().take(3).firstOrNull { it.startsWith("Titel: ") }
+            ?.removePrefix("Titel: ")?.trim() ?: ""
 
     fun durationText(ms: Long): String {
         if (ms < 0L) return ""

@@ -170,7 +170,9 @@ class RecordingService : Service() {
             r.setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
             r.setAudioChannels(1)
             r.setAudioSamplingRate(48_000)
-            r.setAudioEncodingBitRate(48_000)
+            // 24 kbit/s Opus: fuer Sprache und Transkription reichlich, halb so gross wie vorher
+            // (1,5 Std. etwa 16 MB statt 33 MB).
+            r.setAudioEncodingBitRate(24_000)
             r.setOutputFile(file.absolutePath)
             r.prepare()
             r.start()
