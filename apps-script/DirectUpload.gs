@@ -1,8 +1,17 @@
 /**
  * DirectUpload.gs - Schnittstelle fuer die Android-App "Aufnahme".
- * Version 4 (2026-11-05)
+ * Version 5 (2026-11-06)
  *
- * Neu in Version 4:
+ * Neu in Version 5:
+ *   - Die Executive Summary in Mail und .txt ist immer auf Englisch, egal in
+ *     welcher Sprache gesprochen wurde. Sie entsteht im selben Aufruf wie der
+ *     Titel aus dem ganzen Transkript (Themen, Entscheidungen, offene Punkte,
+ *     Aufgaben mit Verantwortlichen). Faellt der Aufruf aus, bleibt die
+ *     Zusammenfassung von AssemblyAI (in der Sprache des Gespraechs).
+ *   - Der Titel bleibt in der Sprache des Gespraechs.
+ *   - Code.gs unveraendert gegenueber Version 4.
+ *
+ * Version 4:
  *   - Kurzer Titel pro Gespraech, damit man in der Mail sofort sieht, welches
  *     Gespraech es war. Ein kleines Sprachmodell ueber das LLM Gateway von
  *     AssemblyAI (gleicher API-Key, kein neuer Dienst) liest Zusammenfassung
@@ -60,7 +69,7 @@ var DRIVE_RESUMABLE_INIT_URL =
 var ALLOWED_UPLOAD_ORIGINS = ['https://obitusde.github.io'];
 
 /** Die App fragt per "hello" danach und schaltet neue Funktionen erst ab 2 frei. */
-var APP_API_VERSION = 4;
+var APP_API_VERSION = 5;
 
 var APP_MAIL_CHOICES = ['work', 'private', 'none'];
 var APP_CONTEXT_MAX = 500;
@@ -74,14 +83,19 @@ var ARCHIVE_CLEANUP_HANDLER = 'cleanupArchive';
 /** Ein Lauf darf hoechstens so lange dauern (Apps-Script-Limit: 6 Min.). */
 var ARCHIVE_CLEANUP_MAX_MS = 4 * 60 * 1000;
 
-/** Titel pro Gespraech ueber das LLM Gateway von AssemblyAI. */
+/** Titel und englische Executive Summary ueber das LLM Gateway von AssemblyAI. */
 var LLM_GATEWAY_URL = 'https://llm-gateway.assemblyai.com/v1/chat/completions';
 /** Der Reihe nach probiert; das erste brauchbare Ergebnis gilt. */
 var TITLE_MODELS = ['claude-haiku-4-5-20251001', 'gemini-2.5-flash-lite'];
 var TITLE_MAX = 60;
-/** So viel Transkript geht ans Modell: Anfang und Ende (lange Gespraeche). */
-var TITLE_TRANSCRIPT_HEAD = 40000;
-var TITLE_TRANSCRIPT_TAIL = 8000;
+var SUMMARY_MAX_BULLETS = 10;
+/**
+ * So viel Transkript geht ans Modell (Zeichen). 300.000 Zeichen sind etwa
+ * 5 Stunden Gespraech; nur noch laengere werden in der Mitte gekuerzt.
+ */
+var LLM_TRANSCRIPT_HEAD = 260000;
+var LLM_TRANSCRIPT_TAIL = 40000;
+var LLM_MAX_TOKENS = 1200;
 var WEEKDAYS_DE = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
 
 /**
@@ -334,15 +348,14 @@ function deliverTranscript_(file, fileName, transcriptText, summaryInfo, confide
   var opts = readAppOptions_(file);
   var text = opts.context ? 'Kontext: ' + opts.context + '\n\n' + transcriptText : transcriptText;
 
-  // Kurzer Titel fuer Betreff, .txt und App. Darf nie die Mail verhindern.
-  var title = buildConversationTitle_(transcriptText, summaryInfo, opts.context);
-  var mailSummary = {
-    text: summaryInfo && summaryInfo.text ? summaryInfo.text : null,
-    headline: title || null
-  };
+  // Titel (Sprache des Gespraechs) und Executive Summary (Englisch) fuer
+  // Betreff, Mail, .txt und App. Darf nie die Mail verhindern.
+  var extras = buildMailExtras_(transcriptText, summaryInfo, opts.context);
+  var title = extras.title;
+  var mailSummary = { text: extras.summary || null, headline: title || null };
 
   try {
-    saveTranscriptFile_(fileName, text, summaryInfo, title);
+    saveTranscriptFile_(fileName, text, mailSummary, title);
   } catch (err) {
     Logger.log('Transkript-Datei konnte nicht gespeichert werden: ' + err.message);
   }
@@ -407,7 +420,7 @@ function saveTranscriptFile_(fileName, text, summaryInfo, title) {
   var parts = [];
   if (title) parts.push('Titel: ' + title, '');
   if (summaryInfo && summaryInfo.text) {
-    parts.push('Zusammenfassung:', summaryInfo.text, '', '---', '');
+    parts.push('Executive Summary:', summaryInfo.text, '', '---', '');
   }
   parts.push(text);
   var content = parts.join('\n');
@@ -441,39 +454,59 @@ function formatSubjectStamp_(stamp) {
 }
 
 /**
- * Bester verfuegbarer kurzer Titel: Sprachmodell, sonst erste Ueberschrift
- * der AssemblyAI-Zusammenfassung, sonst der Kontext. Wirft nie.
+ * Titel und Executive Summary aus der besten verfuegbaren Quelle. Wirft nie.
+ *
+ *   title:   Sprachmodell, sonst erste Ueberschrift der AssemblyAI-
+ *            Zusammenfassung, sonst der Kontext aus der App ("" = keiner).
+ *   summary: englische Stichpunkte vom Sprachmodell, sonst die
+ *            AssemblyAI-Zusammenfassung ("" = keine).
  */
-function buildConversationTitle_(transcriptText, summaryInfo, context) {
-  var title = '';
+function buildMailExtras_(transcriptText, summaryInfo, context) {
+  var fromLlm = { title: '', summary: '' };
   try {
-    title = askTitle_(transcriptText, summaryInfo, context);
+    fromLlm = askLlm_(transcriptText, summaryInfo, context);
   } catch (err) {
-    Logger.log('Titel vom Sprachmodell nicht verfuegbar: ' + err.message);
+    Logger.log('Sprachmodell nicht verfuegbar: ' + err.message);
   }
+  var title = fromLlm.title;
   if (!title && summaryInfo && summaryInfo.headline) title = cleanTitle_(summaryInfo.headline);
   if (!title && context) title = cleanTitle_(context);
-  return title;
+  var summary = fromLlm.summary || (summaryInfo && summaryInfo.text) || '';
+  return { title: title, summary: summary };
 }
 
-function askTitle_(transcriptText, summaryInfo, context) {
+/** Nur der Titel (fuer Aufrufer, die keine Zusammenfassung brauchen). */
+function buildConversationTitle_(transcriptText, summaryInfo, context) {
+  return buildMailExtras_(transcriptText, summaryInfo, context).title;
+}
+
+function llmPrompt_(transcriptText, summaryInfo, context) {
   var text = String(transcriptText || '');
-  if (!text.trim()) return '';
-  var excerpt = text.length > TITLE_TRANSCRIPT_HEAD + TITLE_TRANSCRIPT_TAIL
-    ? text.slice(0, TITLE_TRANSCRIPT_HEAD) + '\n[...]\n' + text.slice(-TITLE_TRANSCRIPT_TAIL)
+  var excerpt = text.length > LLM_TRANSCRIPT_HEAD + LLM_TRANSCRIPT_TAIL
+    ? text.slice(0, LLM_TRANSCRIPT_HEAD) + '\n[...]\n' + text.slice(-LLM_TRANSCRIPT_TAIL)
     : text;
 
   var parts = [
-    'Formuliere einen sehr kurzen Titel fuer dieses Gespraech (3 bis 8 Woerter, hoechstens ' +
-      TITLE_MAX + ' Zeichen), damit man im Mail-Postfach sofort erkennt, welches Gespraech es war. ' +
-      'Nenne konkret das Hauptthema und, wenn klar, die wichtigsten Personen. ' +
-      'Schreibe in der Hauptsprache des Gespraechs. ' +
-      'Gib nur den Titel aus: kein Datum, keine Anfuehrungszeichen, kein Punkt am Ende.'
+    'Below is the transcript of a recorded conversation. Reply with JSON only (no code fence, no other text):',
+    '{"title": "...", "summary": ["...", "..."]}',
+    'title: a very short title in the MAIN LANGUAGE OF THE CONVERSATION, 3 to 8 words, at most ' +
+      TITLE_MAX + ' characters, so the reader instantly recognizes which conversation it was. ' +
+      'Name the main topic and, if clear, the key people. No date, no quotes, no trailing period.',
+    'summary: an executive summary ALWAYS IN ENGLISH, regardless of the language spoken. ' +
+      '4 to 8 concise bullet points covering the key topics, decisions, open issues and action items ' +
+      '(with owner and due date if mentioned). One bullet per array item, without bullet characters.'
   ];
-  if (context) parts.push('Hinweis der Person, die aufgenommen hat: ' + context);
-  if (summaryInfo && summaryInfo.text) parts.push('Zusammenfassung des ganzen Gespraechs:\n' + summaryInfo.text);
-  parts.push('Transkript:\n' + excerpt);
-  var prompt = parts.join('\n\n');
+  if (context) parts.push('Note from the person who recorded it: ' + context);
+  if (summaryInfo && summaryInfo.text) parts.push('Automatic summary (may be in another language):\n' + summaryInfo.text);
+  parts.push('Transcript:\n' + excerpt);
+  return parts.join('\n\n');
+}
+
+/** Fragt das Sprachmodell; liefert { title, summary } (leere Strings, wenn nichts kam). */
+function askLlm_(transcriptText, summaryInfo, context) {
+  var empty = { title: '', summary: '' };
+  if (!String(transcriptText || '').trim()) return empty;
+  var prompt = llmPrompt_(transcriptText, summaryInfo, context);
   var key = getApiKey();
 
   for (var i = 0; i < TITLE_MODELS.length; i++) {
@@ -485,22 +518,51 @@ function askTitle_(transcriptText, summaryInfo, context) {
         payload: JSON.stringify({
           model: TITLE_MODELS[i],
           messages: [{ role: 'user', content: prompt }],
-          max_tokens: 60
+          max_tokens: LLM_MAX_TOKENS
         }),
         muteHttpExceptions: true
       });
       if (res.getResponseCode() !== 200) {
-        Logger.log('Titel (' + TITLE_MODELS[i] + '): HTTP ' + res.getResponseCode() + ' ' +
+        Logger.log('Sprachmodell (' + TITLE_MODELS[i] + '): HTTP ' + res.getResponseCode() + ' ' +
           res.getContentText().slice(0, 200));
         continue;
       }
-      var title = cleanTitle_(readChatContent_(JSON.parse(res.getContentText())));
-      if (title) return title;
+      var parsed = parseLlmAnswer_(readChatContent_(JSON.parse(res.getContentText())));
+      if (parsed.title || parsed.summary) return parsed;
+      Logger.log('Sprachmodell (' + TITLE_MODELS[i] + '): Antwort nicht verwertbar.');
     } catch (err) {
-      Logger.log('Titel (' + TITLE_MODELS[i] + '): ' + err.message);
+      Logger.log('Sprachmodell (' + TITLE_MODELS[i] + '): ' + err.message);
     }
   }
-  return '';
+  return empty;
+}
+
+/** JSON aus der Modell-Antwort lesen (auch mit Code-Fence oder Text drumherum). */
+function parseLlmAnswer_(raw) {
+  var empty = { title: '', summary: '' };
+  var s = String(raw || '');
+  var from = s.indexOf('{');
+  var to = s.lastIndexOf('}');
+  if (from < 0 || to <= from) return empty;
+  var obj;
+  try {
+    obj = JSON.parse(s.slice(from, to + 1));
+  } catch (err) {
+    return empty;
+  }
+  if (!obj || typeof obj !== 'object') return empty;
+
+  var items = Array.isArray(obj.summary) ? obj.summary
+    : (typeof obj.summary === 'string' ? obj.summary.split('\n') : []);
+  var bullets = items
+    .map(function (b) { return String(b || '').replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').replace(/\s+/g, ' ').trim(); })
+    .filter(Boolean)
+    .slice(0, SUMMARY_MAX_BULLETS);
+
+  return {
+    title: cleanTitle_(typeof obj.title === 'string' ? obj.title : ''),
+    summary: bullets.map(function (b) { return '- ' + b; }).join('\n')
+  };
 }
 
 /** Text aus einer Chat-Completions-Antwort (String oder Liste von Teilen). */
